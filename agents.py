@@ -226,7 +226,7 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         }
 
 # =============================================================
-# 3. 🌐 MOTOR DE BUSCA WEB PROFUNDA (MULTI-FONTE + CONTEXTO)
+# 3. 🌐 MOTOR DE BUSCA WEB PROFUNDA (WIKIPÉDIA FULL + NEWS + DDG)
 # =============================================================
 
 def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, bool]:
@@ -236,7 +236,8 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
         "noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", 
         "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", 
         "eleicao", "presidente", "ganhou", "venceu", "resultado", "turno",
-        "votos", "bolsonaro", "flávio", "flavio", "lula", "2026", "2025"
+        "votos", "disputa", "disputou", "acirrada", "bolsonaro", "flávio", 
+        "flavio", "lula", "2026", "2025"
     ]
     eh_noticia = any(t in texto_base for t in termos_noticia)
     
@@ -248,7 +249,7 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
         "bom dia", "boa tarde", "boa noite", "quem", "qual", "quais",
         "como", "onde", "quando", "por que", "porque", "ficou", "foi",
         "bem", "muito", "sobre", "para", "com", "que", "uma", "uns",
-        "mas", "ele", "ela", "não", "nao", "sim", "então", "entao"
+        "mas", "ele", "ela", "não", "nao", "sim", "então", "entao", "quantos"
     ]
     
     termo = texto_base
@@ -279,35 +280,42 @@ def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
     query_segura = mascarar_dados_sensiveis(query_limpa)
     blocos_coletados = []
 
-    # 1. Google News RSS (Com extração de título + descrição limpa)
+    # 1. Wikipédia API com Extrato Completo (Imune a bloqueio de IP e contém candidatos e percentagens exatas)
     try:
-        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query_segura)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-        r_rss = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if r_rss.status_code == 200:
-            root = ET.fromstring(r_rss.content)
-            for item in root.findall(".//item")[:6]:
-                titulo = item.findtext("title") or ""
-                desc_html = item.findtext("description") or ""
-                desc_limpa = re.sub(r'<.*?>', ' ', desc_html)
-                desc_limpa = " ".join(desc_limpa.split())
-                pub_date = item.findtext("pubDate") or ""
-                if titulo:
-                    data_curta = f" ({pub_date[:16]})" if pub_date else ""
-                    detalhe = f"\nResumo: {desc_limpa}" if desc_limpa and desc_limpa not in titulo else ""
-                    blocos_coletados.append(f"📰 **{titulo}**{data_curta}{detalhe}")
+        wiki_search_url = (
+            f"https://pt.wikipedia.org/w/api.php?action=query&list=search"
+            f"&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
+        )
+        r_ws = requests.get(wiki_search_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
+        if r_ws.status_code == 200:
+            resultados_wiki = r_ws.json().get("query", {}).get("search", [])
+            for w in resultados_wiki[:2]:
+                titulo_pag = w.get("title", "")
+                if titulo_pag:
+                    ext_url = (
+                        f"https://pt.wikipedia.org/w/api.php?action=query&prop=extracts"
+                        f"&exintro=1&explaintext=1&redirects=1&titles={urllib.parse.quote(titulo_pag)}&format=json"
+                    )
+                    r_ext = requests.get(ext_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
+                    if r_ext.status_code == 200:
+                        pages = r_ext.json().get("query", {}).get("pages", {})
+                        for _, p_data in pages.items():
+                            extrato = p_data.get("extract", "").strip()
+                            if extrato:
+                                blocos_coletados.append(f"📚 **Wikipédia ({titulo_pag})**\n{extrato[:1200]}")
     except Exception:
         pass
 
-    # 2. DuckDuckGo News & Text (Complementa com trechos de matérias e números/porcentagens)
+    # 2. DuckDuckGo News & Text (Coleta trechos jornalísticos detalhados)
     try:
         with DDGS(timeout=8) as ddgs:
             if eh_noticia:
-                for r in ddgs.news(query_segura, safesearch="moderate", max_results=5):
+                for r in ddgs.news(query_segura, safesearch="moderate", max_results=4):
                     t = r.get('title', '')
                     b = r.get('body', '')
                     if b:
                         blocos_coletados.append(f"📰 **{t}**\n{b}")
-            for r in ddgs.text(query_segura, safesearch="moderate", max_results=5):
+            for r in ddgs.text(query_segura, safesearch="moderate", max_results=4):
                 t = r.get('title', '')
                 b = r.get('body', '')
                 if b and len(b) > 25:
@@ -315,20 +323,20 @@ def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
     except Exception:
         pass
 
-    # 3. Wikipédia em Português (Para dados enciclopédicos/históricos)
-    if len(blocos_coletados) < 3:
-        try:
-            wiki_url = f"https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
-            r_wiki = requests.get(wiki_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
-            if r_wiki.status_code == 200:
-                wiki_data = r_wiki.json().get("query", {}).get("search", [])
-                for w in wiki_data[:3]:
-                    t_w = w.get("title", "")
-                    s_w = re.sub(r'<.*?>', '', w.get("snippet", ""))
-                    if s_w:
-                        blocos_coletados.append(f"📚 **Wikipédia ({t_w})**\n{s_w}...")
-        except Exception:
-            pass
+    # 3. Google News RSS (Sem repetir o título no resumo)
+    try:
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query_segura)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+        r_rss = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r_rss.status_code == 200:
+            root = ET.fromstring(r_rss.content)
+            for item in root.findall(".//item")[:5]:
+                titulo = (item.findtext("title") or "").strip()
+                pub_date = item.findtext("pubDate") or ""
+                if titulo:
+                    data_curta = f" ({pub_date[:16]})" if pub_date else ""
+                    blocos_coletados.append(f"📰 **{titulo}**{data_curta}")
+    except Exception:
+        pass
 
     if blocos_coletados:
         return "\n\n".join(blocos_coletados[:10])
@@ -488,18 +496,17 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
     p = prompt.lower().strip()
     hist_lower = historico_txt.lower()
 
-    # Gatilhos de eventos recentes, política, eleições e perguntas de continuação sobre fatos
     gatilhos_forcar_web = [
         "eleições", "eleicao", "eleito", "presidente", "quem ganhou", "quem venceu",
-        "segundo turno", "primeiro turno", "acirrada", "quantos %", "porcentagem",
-        "votos", "bolsonaro", "flávio", "flavio", "lula", "boulos", "tarcísio", "tarcisio",
-        "2025", "2026", "notícias", "noticia", "ultimas", "últimas", "clima", "previsão",
-        "tempo hoje", "cotação", "dólar", "bitcoin", "pesquise", "busque", "procure na web", "na internet"
+        "segundo turno", "primeiro turno", "acirrada", "disputa", "disputou", "adversário",
+        "quantos %", "porcentagem", "votos", "bolsonaro", "flávio", "flavio", "lula", 
+        "boulos", "tarcísio", "tarcisio", "2025", "2026", "notícias", "noticia", 
+        "ultimas", "últimas", "clima", "previsão", "tempo hoje", "cotação", "dólar", 
+        "bitcoin", "pesquise", "busque", "procure na web", "na internet"
     ]
     if any(g in p for g in gatilhos_forcar_web):
         return {"intencao": "BUSCA_WEB", "parametros": {"query": prompt}}
 
-    # Se a conversa imediatamente anterior já era sobre eleições/2026/notícias, mantém na BUSCA_WEB
     temas_atuais_historico = ["eleições", "eleição", "presidente", "2026", "segundo turno", "notícias"]
     if any(t in hist_lower for t in temas_atuais_historico) and len(p.split()) <= 18:
         return {"intencao": "BUSCA_WEB", "parametros": {"query": prompt}}
@@ -600,20 +607,22 @@ def gerar_micro_resumo(contexto_historico: str, id_modelo: str) -> str:
 CACHE_RESPOSTAS_TEMP = {}
 
 def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list) -> str:
-    """Aciona LLM secundário gratuito ou responde usando os dados reais coletados se a API principal falhar."""
-    try:
-        res_backup = requests.post(
-            "https://text.pollinations.ai/openai",
-            json={"model": "openai", "messages": messages, "temperature": 0.2},
-            timeout=20
-        )
-        if res_backup.status_code == 200:
-            conteudo = res_backup.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            if conteudo:
-                CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = conteudo
-                return conteudo
-    except Exception:
-        pass
+    """Tenta múltiplos modelos gratuitos antes de recorrer à exibição direta dos dados."""
+    for modelo_alt in ["openai", "mistral", "openai-fast"]:
+        try:
+            time.sleep(0.8)
+            res_backup = requests.post(
+                "https://text.pollinations.ai/openai",
+                json={"model": modelo_alt, "messages": messages, "temperature": 0.2},
+                timeout=25
+            )
+            if res_backup.status_code == 200:
+                conteudo = res_backup.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                if conteudo and len(conteudo.strip()) > 10:
+                    CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = conteudo
+                    return conteudo
+        except Exception:
+            continue
 
     chave_prompt = prompt.lower().strip()
     if chave_prompt in CACHE_RESPOSTAS_TEMP:
@@ -626,11 +635,11 @@ def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, m
     if contexto_anexos:
         return f"Analisei os documentos anexados. Aqui estão as informações extraídas:\n\n{contexto_anexos}"
     if contexto_web and "⚠️" not in contexto_web:
-        return f"Aqui estão as notícias e dados verificados que encontrei na web sobre a sua pergunta:\n\n{contexto_web}"
+        return f"Com base nas fontes verificadas em tempo real:\n\n{contexto_web}"
     if memoria_vetorial:
         return f"Consultando minha memória pessoal (ChromaDB), encontrei estes registros:\n\n{memoria_vetorial}"
 
-    return "O motor de linguagem está processando muitas requisições neste segundo. Aguarde alguns instantes e envie novamente, ou insira sua chave gratuita do Gemini em '🔑 Configurar API' na barra lateral para velocidade máxima!"
+    return "O servidor gratuito atingiu o limite momentâneo de requisições. Aguarde alguns segundos ou insira sua chave gratuita do Google AI Studio em '🔑 Configurar API' na barra lateral!"
 
 def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexos: list = None):
     """Executa o pipeline multimodal em 2 passos com suporte a Sandbox Python, PDFs, Dados e Imagens."""
@@ -723,7 +732,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         f"Você é o Lume, assistente inteligente criado pelo Gabriel (Biel). Hoje é {data_hoje}.",
         "Responda sempre em português do Brasil com clareza, precisão factual e naturalidade.",
         "⚠️ DIRETRIZ DE IDENTIDADE: Assuma 100% a sua identidade como Lume.",
-        "⚠️ REGRA RÍGIDA ANTI-ALUCINAÇÃO: NUNCA misture nomes de políticos (como criar nomes inexistentes) e NUNCA chute porcentagens eleitorais que não estejam explicitamente escritas nos resultados da busca web abaixo. Se o usuário perguntar uma porcentagem exata e ela não estiver no bloco 'FONTES VERIFICADAS DA WEB', informe os dados reais disponíveis nas fontes e diga com transparência caso o percentual exato não conste no resumo da matéria.",
+        "⚠️ REGRA RÍGIDA ANTI-ALUCINAÇÃO: NUNCA misture nomes de políticos e NUNCA chute porcentagens eleitorais que não estejam explicitamente escritas nos resultados da busca web abaixo. Sintetize a resposta em parágrafos fluidos usando os dados de 'FONTES VERIFICADAS DA WEB'.",
         "⚠️ DIRETRIZ DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura para guardar fatos que o usuário pedir explicitamente."
     ]
 
@@ -738,14 +747,13 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
 
     messages = [{"role": "system", "content": "\n".join(partes_sistema)}]
 
-    for a, t, _ in mensagens_anteriores:
-        messages.append({"role": "user" if a == "user" else "assistant", "content": t})
+    for a, t, _ in mensagens_anteriores[-4:]:
+        messages.append({"role": "user" if a == "user" else "assistant", "content": t[:1200]})
 
     if contexto_web:
         prompt_enriquecido = (
             f"Pergunta do usuário: {prompt}\n\n"
-            f"[Instrução Interna: Responda com base nas FONTES VERIFICADAS DA WEB acima. "
-            f"Não invente nomes compostos nem chute números que não estejam nos textos coletados.]"
+            f"[Instrução Interna: Responda de forma conversacional usando os dados das FONTES VERIFICADAS DA WEB acima.]"
         )
         messages.append({"role": "user", "content": prompt_enriquecido})
     else:
@@ -768,7 +776,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
             
     except Exception as e:
-        print(f"⚠️ API principal oscilou ({e}). Acionando contingência...")
+        print(f"⚠️ API principal oscilou ({e}). Acionando contingência multi-modelo...")
         resposta_fallback = gerar_resposta_contingencia(
             prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages
         )
