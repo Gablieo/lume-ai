@@ -1,576 +1,800 @@
 import os
-import json
-import time
+# Silencia avisos de symlink do Hugging Face no Windows
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 import re
-import streamlit as st
-import streamlit.components.v1 as components
-from fpdf import FPDF
+import io
+import sys
+import time
+import gc
+import json
+import random
+import base64
+import requests
+import traceback
+import contextlib
+import urllib.parse
+from datetime import datetime
+from openai import OpenAI
 
-from database import (
-    carregar_conversas, carregar_mensagens, criar_nova_conversa, 
-    salvar_mensagem, atualizar_titulo_conversa, deletar_conversa
-)
-from agents import processar_resposta_ia_stream
+try:
+    import streamlit as st
+except ImportError:
+    st = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
+
+try:
+    from crewai import Agent, Crew, Process, Task, LLM
+except ImportError:
+    pass
+
+from database import carregar_mensagens
 from vector_db import (
-    salvar_memoria, consultar_memoria, listar_todas_memorias,
-    deletar_memoria_por_id, atualizar_memoria_por_id, deletar_resumo_chat,
-    collection_resumos
+    consultar_memoria, 
+    salvar_memoria, 
+    consultar_resumos_chats, 
+    salvar_ou_atualizar_resumo_chat
 )
 
-st.set_page_config(page_title="Lume", page_icon="✦", layout="wide")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+FREE_LLM_BASE_URL = "https://text.pollinations.ai/openai"
 
-# =============================================================
-# PERSISTÊNCIA DE PASTAS
-# =============================================================
-
-ARQUIVO_PASTAS = "pastas_lume.json"
-
-def carregar_dados_pastas() -> dict:
-    if os.path.exists(ARQUIVO_PASTAS):
+def obter_chave_gemini() -> str:
+    """Busca a chave na sessão da barra lateral, variável de ambiente ou Secrets do Streamlit."""
+    if st is not None:
         try:
-            with open(ARQUIVO_PASTAS, "r", encoding="utf-8") as f:
-                return json.load(f)
+            chave_sessao = st.session_state.get("GEMINI_API_KEY", "")
+            if chave_sessao and chave_sessao.strip():
+                return chave_sessao.strip()
         except Exception:
             pass
-    return {"pastas": ["Geral"], "chat_pasta": {}}
 
-def salvar_dados_pastas(dados: dict):
-    try:
-        with open(ARQUIVO_PASTAS, "w", encoding="utf-8") as f:
-            json.dump(dados, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Erro ao salvar pastas: {e}")
+    chave_env = os.environ.get("GEMINI_API_KEY", "")
+    if chave_env and chave_env.strip():
+        return chave_env.strip()
 
-# =============================================================
-# FUNÇÕES DE TRATAMENTO DE TEXTO, IMAGEM E PDF
-# =============================================================
-
-def limpar_vazamentos_llm(texto: str) -> str:
-    if not texto:
-        return ""
-    
-    padroes_vazamento = [
-        r"^#*\s*i will then.*$",
-        r"^#*\s*don't forget.*$",
-        r"^#*\s*thought:?.*$",
-        r"^#*\s*action:?.*$",
-        r"^#*\s*final answer:?.*$",
-        r"^#*\s*final_answer:?.*$",
-        r"^agora que você está pronto para sua resposta final.*$",
-        r"^para responder à sua pergunta original.*$"
-    ]
-    
-    linhas = texto.split("\n")
-    linhas_limpas = []
-    
-    for linha in linhas:
-        linha_strip = linha.strip()
-        if any(re.match(padrao, linha_strip, re.IGNORECASE) for padrao in padroes_vazamento):
-            continue
-        linhas_limpas.append(linha)
-        
-    resultado_texto = "\n".join(linhas_limpas).strip()
-    resultado_texto = re.sub(r'^(FINAL ANSWER|FINAL_ANSWER|Thought:|Action:)\s*', '', resultado_texto, flags=re.IGNORECASE).strip()
-    
-    return resultado_texto
-
-def renderizar_conteudo_assistente(texto: str):
-    """Renderiza texto, imagens geradas e plots do Code Interpreter com tamanho controlado."""
-    texto_limpo = limpar_vazamentos_llm(texto)
-    
-    if "[IMAGEM_GERADA:" in texto_limpo:
-        partes = texto_limpo.split("[IMAGEM_GERADA:")
-        texto_antes = partes[0].strip()
-        
-        resto = partes[1].split("]", 1)
-        caminho_img = resto[0].strip()
-        texto_depois = resto[1].strip() if len(resto) > 1 else ""
-        
-        if texto_antes:
-            st.markdown(texto_antes)
-        if os.path.exists(caminho_img) or caminho_img.startswith("http"):
-            st.image(caminho_img, caption="Gráfico / Imagem gerada pelo Lume", width=460)
-        if texto_depois:
-            st.markdown(texto_depois)
-    else:
-        st.markdown(texto_limpo)
-
-def sanitizar_texto_latin1(texto: str) -> str:
-    texto = limpar_vazamentos_llm(texto)
-    texto = texto.replace("\t", "    ").replace("\xa0", " ").replace("•", "-")
-    texto = re.sub(r'\*\*(.*?)\*\*', r'\1', texto)
-    texto = re.sub(r'\*(.*?)\*', r'\1', texto)
-    return re.sub(r'[^\x00-\xFF]', '', texto)
-
-def gerar_pdf_bytes(texto: str) -> bytes:
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.set_font("Helvetica", size=11)
-    
-    texto_limpo = sanitizar_texto_latin1(texto)
-    linhas = texto_limpo.split("\n")
-    
-    for linha in linhas:
-        linha_str = linha.strip()
-        if not linha_str:
-            pdf.ln(3)
-            continue
-        
-        linha_safe = linha_str.encode('latin-1', 'replace').decode('latin-1')
-        
+    if st is not None:
         try:
-            if linha_str.startswith("#"):
-                pdf.set_font("Helvetica", "B", 13)
-                pdf.set_text_color(30, 30, 35)
-                texto_h = linha_safe.lstrip("#").strip()
-                pdf.multi_cell(0, 7, text=texto_h)
-                pdf.ln(2)
-            elif linha_str.startswith(("* ", "- ")) or (len(linha_str) > 2 and linha_str[0].isdigit() and linha_str[1] == "."):
-                pdf.set_font("Helvetica", "", 11)
-                pdf.set_text_color(50, 50, 50)
-                item_txt = f"- {linha_safe.lstrip('*-0123456789. ')}"
-                pdf.multi_cell(0, 6, text=item_txt)
-            else:
-                pdf.set_font("Helvetica", "", 11)
-                pdf.set_text_color(50, 50, 50)
-                pdf.multi_cell(0, 6, text=linha_safe)
-        except Exception as e:
-            print(f"⚠️ Aviso ao renderizar PDF: {e}")
-            continue
-            
-    return bytes(pdf.output())
+            chave_secret = st.secrets.get("GEMINI_API_KEY", "")
+            if chave_secret and chave_secret.strip():
+                return chave_secret.strip()
+        except Exception:
+            pass
 
-# =============================================================
-# CSS OFICIAL GEMINI DARK UI
-# =============================================================
+    return ""
 
-st.markdown("""
-<style>
-    .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] { 
-        background-color: #131316 !important; 
-        color: #E3E3E3 !important; 
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    
-    [data-testid="stBottom"], [data-testid="stBottom"] > div, div[data-testid="stBottomBlockContainer"] {
-        background-color: #131316 !important; background: #131316 !important; border: none !important;
-    }
-
-    [data-testid="stSidebar"] { 
-        background-color: #17171A !important; border-right: 1px solid #282830 !important; 
-    }
-    
-    .stSidebar .stButton > button { 
-        background-color: transparent !important; color: #C4C7C5 !important; 
-        border: none !important; border-radius: 10px !important; text-align: left !important; 
-        padding: 8px 10px !important; font-weight: 400 !important; transition: background-color 0.2s ease !important;
-    }
-    .stSidebar .stButton > button:hover { background-color: #282A2D !important; color: #FFFFFF !important; }
-
-    div[data-baseweb="select"] > div { 
-        background-color: #1E1F20 !important; border-color: #333538 !important; 
-        color: #E3E3E3 !important; border-radius: 10px !important; 
-    }
-
-    /* Barra de entrada Gemini com suporte a anexo embutido */
-    [data-testid="stChatInput"] { max-width: 820px !important; margin: 0 auto !important; padding-bottom: 24px !important; }
-    
-    [data-testid="stChatInput"] > div { 
-        background-color: #1E1F20 !important; border: 1px solid #333538 !important; 
-        border-radius: 28px !important; padding: 6px 14px !important; 
-        box-shadow: 0 6px 24px rgba(0,0,0,0.35) !important; transition: all 0.2s ease-in-out !important; 
-    }
-    [data-testid="stChatInput"] > div:focus-within { 
-        border-color: #444746 !important; background-color: #232427 !important; 
-        box-shadow: 0 8px 30px rgba(0,0,0,0.5) !important; outline: none !important; 
-    }
-    [data-testid="stChatInput"] textarea { 
-        color: #E3E3E3 !important; font-size: 15px !important; line-height: 1.5 !important; 
-        background-color: transparent !important; border: none !important; box-shadow: none !important; 
-    }
-    [data-testid="stChatInput"] textarea::placeholder { color: #8E918F !important; }
-    
-    [data-testid="stChatInput"] button { 
-        background-color: #282A2D !important; color: #E3E3E3 !important; border-radius: 50% !important; 
-        border: none !important; width: 34px !important; height: 34px !important; transition: all 0.2s ease !important; 
-    }
-    [data-testid="stChatInput"] button:hover { background-color: #383B3E !important; color: #FFFFFF !important; }
-
-    div[data-testid="stDownloadButton"] > button { 
-        background-color: #1E1F20 !important; color: #C4C7C5 !important; border: 1px solid #333538 !important; 
-        border-radius: 12px !important; padding: 4px 12px !important; font-size: 12px !important; transition: all 0.2s ease !important; 
-    }
-    div[data-testid="stDownloadButton"] > button:hover { 
-        background-color: #282A2D !important; color: #FFFFFF !important; border-color: #444746 !important; 
-    }
-    
-    .lume-dot {
-        width: 6px;
-        height: 6px;
-        background-color: #8E918F;
-        border-radius: 50%;
-        display: inline-block;
-        animation: lume-bounce 1.4s infinite ease-in-out both;
-    }
-    .lume-dot-1 { animation-delay: -0.32s; }
-    .lume-dot-2 { animation-delay: -0.16s; }
-    .lume-dot-3 { animation-delay: 0s; }
-    
-    @keyframes lume-bounce {
-        0%, 80%, 100% { transform: scale(0.3); opacity: 0.3; }
-        40% { transform: scale(1.1); opacity: 1; background-color: #E3E3E3; }
-    }
-    
-    #MainMenu, footer {visibility: hidden;}
-</style>
-""", unsafe_allow_html=True)
-
-if "chat_atual_id" not in st.session_state:
-    st.session_state.chat_atual_id = None
-
-if "GEMINI_API_KEY" not in st.session_state:
-    st.session_state["GEMINI_API_KEY"] = ""
-
-# =============================================================
-# BARRA LATERAL (SIDEBAR COM PASTAS E CONFIGURAÇÃO DE API)
-# =============================================================
-
-with st.sidebar:
-    st.markdown("<h3 style='color: #E3E3E3; font-size: 18px; padding-left: 8px;'>✦ Lume</h3>", unsafe_allow_html=True)
-    
-    if st.button("➕  Nova conversa", use_container_width=True):
-        st.session_state.chat_atual_id = None
-        st.rerun()
-
-    st.markdown("<p style='color: #8E918F; font-size: 12px; margin-top: 20px; padding-left: 8px;'>Modo de Raciocínio</p>", unsafe_allow_html=True)
-    
-    modo_raciocinio = st.selectbox(
-        "Modo", 
-        ["⚡⚡ Ultra Flash", "⚡ Rápido", "⚖️ Equilibrado", "🧠 Pensamento Profundo"], 
-        index=2, 
-        label_visibility="collapsed"
-    )
-
-    with st.popover("🔑 Configurar API", use_container_width=True):
-        st.markdown("<h4 style='color: #E3E3E3;'>⚡ Chave da API (Sessão)</h4>", unsafe_allow_html=True)
-        nova_chave = st.text_input(
-            "GEMINI_API_KEY (Opcional):",
-            value=st.session_state.get("GEMINI_API_KEY", ""),
-            type="password",
-            placeholder="AIzaSy... (isolada no seu navegador)"
-        )
-        col_api1, col_api2 = st.columns([1, 1])
-        with col_api1:
-            if st.button("💾 Aplicar", use_container_width=True, key="btn_salvar_api"):
-                st.session_state["GEMINI_API_KEY"] = nova_chave.strip()
-                st.success("Chave aplicada!")
-                st.rerun()
-        with col_api2:
-            if st.button("🧹 Limpar", use_container_width=True, key="btn_limpar_api"):
-                st.session_state["GEMINI_API_KEY"] = ""
-                st.info("Usando modo padrão.")
-                st.rerun()
-        st.caption("🔒 Sua chave fica salva apenas na memória temporária da sua aba atual.")
-
-    st.markdown("<hr style='border-color: #282830; margin: 15px 0;'>", unsafe_allow_html=True)
-    st.markdown("<p style='color: #8E918F; font-size: 12px; padding-left: 8px;'>Memória Vetorial (ChromaDB)</p>", unsafe_allow_html=True)
-    
-    novo_fato = st.text_input("Fato manual", placeholder="Digite um fato para gravar...", key="input_memoria", label_visibility="collapsed")
-    if st.button("💾 Gravar Fato", use_container_width=True):
-        if novo_fato.strip():
-            msg = salvar_memoria(novo_fato.strip())
-            st.success(msg)
-            st.rerun()
-
-    with st.popover("⚙️ Gerenciar Banco Vetorial", use_container_width=True):
-        st.markdown("<h4 style='color: #E3E3E3;'>🗂️ Gestão de Memória</h4>", unsafe_allow_html=True)
-        sub_aba_listar, sub_aba_resumos, sub_aba_buscar, sub_aba_adicionar = st.tabs(["📋 Fatos", "🧠 Resumos", "🔍 Buscar", "➕ Criar"])
-
-        with sub_aba_listar:
-            ids, docs = listar_todas_memorias()
-            if not ids:
-                st.info("Nenhum fato manual registrado.")
-            else:
-                st.caption(f"Total: {len(ids)} fatos gravados")
-                for id_m, doc_m in zip(ids, docs):
-                    with st.expander(f"`{id_m[:8]}` — {doc_m[:35]}..."):
-                        novo_texto = st.text_area("Conteúdo:", value=doc_m, key=f"pop_txt_{id_m}", height=80)
-                        col_s, col_d = st.columns([1, 1])
-                        with col_s:
-                            if st.button("💾 Salvar", key=f"pop_save_{id_m}"):
-                                res = atualizar_memoria_por_id(id_m, novo_texto)
-                                st.success(res)
-                                st.rerun()
-                        with col_d:
-                            if st.button("🗑️ Excluir", key=f"pop_del_{id_m}", type="primary"):
-                                res = deletar_memoria_por_id(id_m)
-                                st.warning(res)
-                                st.rerun()
-
-        with sub_aba_resumos:
-            try:
-                dados_r = collection_resumos.get()
-                ids_r = dados_r.get("ids", [])
-                docs_r = dados_r.get("documents", [])
-                if not ids_r:
-                    st.info("Nenhum resumo automático gerado ainda.")
-                else:
-                    st.caption(f"Total: {len(ids_r)} resumos salvos")
-                    for id_r, doc_r in zip(ids_r, docs_r):
-                        st.markdown(f"**`{id_r}`**:\n*{doc_r}*")
-            except Exception as e:
-                st.error(f"Erro ao carregar resumos: {e}")
-
-        with sub_aba_buscar:
-            termo_busca = st.text_input("Buscar por termos:", key="pop_busca")
-            if termo_busca:
-                resultado = consultar_memoria(termo_busca)
-                st.info(resultado if resultado else "Nenhum resultado.")
-
-        with sub_aba_adicionar:
-            nova_info = st.text_area("Texto longo/fato:", key="pop_nova_info")
-            id_ref_add = st.session_state.chat_atual_id if st.session_state.chat_atual_id else "novo"
-            if st.button("📌 Adicionar", key=f"pop_btn_add_{id_ref_add}"):
-                if nova_info.strip():
-                    msg = salvar_memoria(nova_info.strip())
-                    st.success(msg)
-                    st.rerun()
-
-    st.markdown("<hr style='border-color: #282830; margin: 15px 0;'>", unsafe_allow_html=True)
-    
-    # --- GERENCIAMENTO E AGRUPAMENTO POR PASTAS ---
-    dados_pastas = carregar_dados_pastas()
-    pastas_existentes = dados_pastas.get("pastas", ["Geral"])
-    if "Geral" not in pastas_existentes:
-        pastas_existentes.insert(0, "Geral")
-
-    st.markdown("<p style='color: #8E918F; font-size: 12px; padding-left: 8px;'>Pastas & Conversas</p>", unsafe_allow_html=True)
-    
-    with st.popover("📁 Gerenciar Pastas", use_container_width=True):
-        st.markdown("<h4 style='color: #E3E3E3;'>Organizador de Pastas</h4>", unsafe_allow_html=True)
-        nova_pasta_nome = st.text_input("Nova pasta:", placeholder="Ex: Imagens, Estudos...", key="input_nova_pasta")
-        if st.button("➕ Criar Pasta", use_container_width=True, key="btn_criar_pasta"):
-            if nova_pasta_nome.strip() and nova_pasta_nome.strip() not in pastas_existentes:
-                dados_pastas["pastas"].append(nova_pasta_nome.strip())
-                salvar_dados_pastas(dados_pastas)
-                st.rerun()
-        
-        pastas_remover = [p for p in pastas_existentes if p != "Geral"]
-        if pastas_remover:
-            st.markdown("<hr style='border-color: #282830; margin: 10px 0;'>", unsafe_allow_html=True)
-            p_excluir = st.selectbox("Excluir pasta:", pastas_remover, key="sel_del_pasta")
-            if st.button("🗑️ Excluir Pasta Selecionada", key="btn_del_pasta", type="primary", use_container_width=True):
-                dados_pastas["pastas"].remove(p_excluir)
-                for cid, p_nome in list(dados_pastas.get("chat_pasta", {}).items()):
-                    if p_nome == p_excluir:
-                        dados_pastas["chat_pasta"][cid] = "Geral"
-                salvar_dados_pastas(dados_pastas)
-                st.rerun()
-
-    conversas_existentes = carregar_conversas()
-    chat_pasta_map = dados_pastas.get("chat_pasta", {})
-
-    # Agrupa conversas por pasta
-    conversas_por_pasta = {p: [] for p in pastas_existentes}
-    for chat_id, titulo in conversas_existentes:
-        pasta_do_chat = chat_pasta_map.get(str(chat_id), "Geral")
-        if pasta_do_chat not in conversas_por_pasta:
-            conversas_por_pasta[pasta_do_chat] = []
-        conversas_por_pasta[pasta_do_chat].append((chat_id, titulo))
-
-    # Renderiza as pastas como acordions
-    for nome_pasta in pastas_existentes:
-        chats_na_pasta = conversas_por_pasta.get(nome_pasta, [])
-        with st.expander(f"📁 {nome_pasta} ({len(chats_na_pasta)})", expanded=(nome_pasta == "Geral")):
-            if not chats_na_pasta:
-                st.caption("Nenhuma conversa.")
-            else:
-                for chat_id, titulo in chats_na_pasta:
-                    label = f"💬 {titulo[:14]}..." if len(titulo) > 14 else f"💬 {titulo}"
-                    col1, col2, col3 = st.columns([0.65, 0.18, 0.17])
-                    
-                    with col1:
-                        if st.button(label, key=f"chat_{chat_id}", use_container_width=True):
-                            st.session_state.chat_atual_id = chat_id
-                            st.rerun()
-                    
-                    with col2:
-                        with st.popover("📁"):
-                            idx_atual = pastas_existentes.index(nome_pasta) if nome_pasta in pastas_existentes else 0
-                            nova_p = st.selectbox("Mover:", pastas_existentes, index=idx_atual, key=f"mov_sel_{chat_id}")
-                            if st.button("Mover", key=f"btn_mov_{chat_id}", use_container_width=True):
-                                if "chat_pasta" not in dados_pastas:
-                                    dados_pastas["chat_pasta"] = {}
-                                dados_pastas["chat_pasta"][str(chat_id)] = nova_p
-                                salvar_dados_pastas(dados_pastas)
-                                st.rerun()
-                                
-                    with col3:
-                        if st.button("🗑️", key=f"del_{chat_id}"):
-                            deletar_conversa(chat_id)
-                            deletar_resumo_chat(chat_id)
-                            if str(chat_id) in dados_pastas.get("chat_pasta", {}):
-                                del dados_pastas["chat_pasta"][str(chat_id)]
-                                salvar_dados_pastas(dados_pastas)
-                            if st.session_state.chat_atual_id == chat_id:
-                                st.session_state.chat_atual_id = None
-                            st.rerun()
-
-# =============================================================
-# HOLOGRAMA 3D CENTRAL
-# =============================================================
-
-HTML_HOLOGRAM_3D = """<!DOCTYPE html><html><head><style>body { margin: 0; background-color: #131316; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; font-family: sans-serif; } canvas { display: block; } .title { color: #E3E3E3; font-size: 18px; font-weight: 500; margin-top: 15px; } .sub { color: #8E918F; font-size: 13px; margin-top: 5px; }</style></head><body><canvas id="coreCanvas" width="500" height="380"></canvas><div class="title">Lume</div><div class="sub">O que temos para hoje?</div><script>const canvas=document.getElementById('coreCanvas'),ctx=canvas.getContext('2d'),width=500,height=380,cx=250,cy=190;let time=0;const coreNodes=[];for(let i=0;i<40;i++){let u=Math.random(),v=Math.random(),t=u*2*Math.PI,p=Math.acos(2*v-1),r=45;coreNodes.push([r*Math.sin(p)*Math.cos(t),r*Math.sin(p)*Math.sin(t),r*Math.cos(p)])}const ringConfigs=[{r:130,tx:0.4,ty:0.2,spd:0.02,col:"#444746",dash:!1,w:1},{r:140,tx:-0.5,ty:0.8,spd:-0.015,col:"#282830",dash:!0,w:1},{r:110,tx:1.2,ty:-0.5,spd:0.035,col:"#8E918F",dash:!1,w:1},{r:80,tx:0,ty:0,spd:0.05,col:"#FFFFFF",dash:!1,w:2}],rings=ringConfigs.map(c=>{let pts=[];for(let i=0;i<45;i++){let a=i/45*Math.PI*2;pts.push([c.r*Math.cos(a),c.r*Math.sin(a),0])}return{...c,pts,angle:0}});function rotate(x,y,z,ax,ay,az){let cosX=Math.cos(ax),sinX=Math.sin(ax),cosY=Math.cos(ay),sinY=Math.sin(ay),cosZ=Math.cos(az),sinZ=Math.sin(az);let y1=y*cosX-z*sinX,z1=y*sinX+z*cosX,x1=x;let x2=x1*cosY+z1*sinY,z2=-x1*sinY+z1*cosY,y2=y1;let x3=x2*cosZ-y2*sinZ,y3=x2*sinZ+y2*cosZ,z3=z2;return[x3,y3,z3]}function project(x,y,z){let f=300/(360+z);return[cx+x*f,cy+y*f,f]}function animate(){ctx.clearRect(0,0,width,height);time+=0.015;let gAx=time*0.4,gAy=time*0.7,q=[];rings.forEach(r=>{r.angle+=r.spd;let pPts=r.pts.map(p=>{let r1=rotate(p[0],p[1],p[2],0,0,r.angle),r2=rotate(r1[0],r1[1],r1[2],r.tx,r.ty,0),r3=rotate(r2[0],r2[1],r2[2],gAx,gAy,0),pr=project(r3[0],r3[1],r3[2]);return[...pr,r3[2]]});for(let i=0;i<pPts.length;i++){let p1=pPts[i],p2=pPts[(i+1)%pPts.length],zA=(p1[2]+p2[2])/2;if(!r.dash||i%2!==0)q.push({z:zA,type:'line',x1:p1[0],y1:p1[1],x2:p2[0],y2:p2[1],col:zA<-30?"#1c1c21":r.col,w:r.w})}});coreNodes.forEach(n=>{let r=rotate(n[0],n[1],n[2],gAx,gAy,time*1.5),pr=project(r[0],r[1],r[2]);q.push({z:r[2],type:'oval',x:pr[0],y:pr[1],r:Math.max(1,2.5*pr[2]),col:r[2]>0?"#FFFFFF":"#444746"})});q.sort((a,b)=>a.z-b.z);q.forEach(i=>{ctx.beginPath();if(i.type==='line'){ctx.moveTo(i.x1,i.y1);ctx.lineTo(i.x2,i.y2);ctx.strokeStyle=i.col;ctx.lineWidth=i.w;ctx.stroke()}else{ctx.arc(i.x,i.y,i.r,0,Math.PI*2);ctx.fillStyle=i.col;ctx.fill()}});requestAnimationFrame(animate)}animate();</script></body></html>"""
-
-# =============================================================
-# TELA PRINCIPAL DO CHAT
-# =============================================================
-
-if st.session_state.chat_atual_id is not None:
-    mensagens_salvas = carregar_mensagens(st.session_state.chat_atual_id)
-else:
-    mensagens_salvas = []
-
-mostrar_holograma = (len(mensagens_salvas) == 0)
-
-if mostrar_holograma:
-    components.html(HTML_HOLOGRAM_3D, height=470)
-else:
-    for idx, (autor, texto, tempo_msg) in enumerate(mensagens_salvas):
-        if autor == "user":
-            st.markdown(
-                f'<div style="display: flex; justify-content: flex-end; margin: 20px 0;"><div style="background-color: #282A2D; color: #E3E3E3; padding: 12px 20px; border-radius: 20px; max-width: 70%; font-size: 15px;">{texto}</div></div>', 
-                unsafe_allow_html=True
+class ClienteDinamicoOpenAI:
+    """Conecta à API oficial do Gemini quando há chave ou usa o LLM gratuito automaticamente."""
+    @property
+    def chat(self):
+        chave = obter_chave_gemini()
+        if chave:
+            cliente = OpenAI(
+                base_url=GEMINI_BASE_URL,
+                api_key=chave,
+                timeout=90.0
             )
         else:
-            tempo_txt = f" &nbsp; ⏱️ {tempo_msg}" if tempo_msg else ""
+            cliente = OpenAI(
+                base_url=FREE_LLM_BASE_URL,
+                api_key="lume-free-llm",
+                timeout=90.0
+            )
+        return cliente.chat
 
-            st.markdown(f"""
-                <div style="margin: 20px 0 4px 0; font-size: 13px; color: #8E918F; font-weight: 500;">
-                    Lume{tempo_txt}
-                </div>
-            """, unsafe_allow_html=True)
-            
-            # Renderiza com suporte a imagem e plots do Code Interpreter
-            renderizar_conteudo_assistente(texto)
-            
-            prompt_usuario_anterior = ""
-            if idx > 0 and mensagens_salvas[idx-1][0] == "user":
-                # Remove a tag de anexos para não disparar gatilhos indevidos
-                prompt_limpo = re.sub(r'📄 \[Anexos:.*?\]\n\n', '', mensagens_salvas[idx-1][1])
-                prompt_usuario_anterior = prompt_limpo.lower()
-
-            # Gatilhos explícitos para geração do botão de PDF
-            palavras_chave_pdf = ["gerar pdf", "crie um pdf", "criar pdf", "transformar em pdf", "gerar relatório", "baixar arquivo"]
-            if any(p in prompt_usuario_anterior for p in palavras_chave_pdf) and "[IMAGEM_GERADA:" not in texto:
-                pdf_data = gerar_pdf_bytes(texto)
-                st.download_button(
-                    label="📄 Baixar em PDF",
-                    data=pdf_data,
-                    file_name=f"lume_documento_{st.session_state.chat_atual_id}_{idx}.pdf",
-                    mime="application/pdf",
-                    key=f"pdf_btn_{st.session_state.chat_atual_id}_{idx}"
-                )
+client_local = ClienteDinamicoOpenAI()
 
 # =============================================================
-# ENTRADA DO USUÁRIO E CRIAÇÃO AUTOMÁTICA DE CONVERSAS
+# 1. 🛡️ FIREWALL DE SEGURANÇA E PRIVACIDADE E FERRAMENTAS
 # =============================================================
 
-HTML_PENSANDO = """
-    <div style="display: flex; align-items: center; gap: 8px; color: #8E918F; font-size: 14px; margin: 8px 0;">
-        <span>Lume está processando</span>
-        <div style="display: inline-flex; gap: 4px; align-items: center;">
-            <div class="lume-dot lume-dot-1"></div>
-            <div class="lume-dot lume-dot-2"></div>
-            <div class="lume-dot lume-dot-3"></div>
-        </div>
-    </div>
-"""
+def mascarar_dados_sensiveis(texto: str) -> str:
+    texto = re.sub(r'\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b', '[EMAIL PROTEGIDO]', texto)
+    texto = re.sub(r'\b\d{3}\.\d{3}\.\d{3}-\d{2}\b|\b\d{11}\b', '[CPF PROTEGIDO]', texto)
+    texto = re.sub(r'\b(?:\d{4}[-\s]?){3}\d{4}\b', '[CARTAO PROTEGIDO]', texto)
+    texto = re.sub(r'\b(?:\+55\s?)?(?:\(?\d{2}\)?\s?)?9?\d{4}[-\s]?\d{4}\b', '[TELEFONE PROTEGIDO]', texto)
+    return texto
 
-# PERMITE MÚLTIPLOS ARQUIVOS, PDFs, CSVs E PLANILHAS EXCEL
-prompt_input = st.chat_input(
-    "Peça ao Lume...", 
-    accept_file=True, 
-    file_type=["png", "jpg", "jpeg", "webp", "pdf", "csv", "xls", "xlsx"]
-)
+def verificar_injecao_prompt(prompt: str) -> bool:
+    padroes_maliciosos = [
+        "ignore as instruções", "ignore todas as instruções", "esqueça as regras", 
+        "desconsidere as regras", "system prompt", "modo desenvolvedor", 
+        "dan mode", "você agora é", "you are now", "bypassar", 
+        "quais são suas instruções", "revele seu prompt"
+    ]
+    return any(p in prompt.lower() for p in padroes_maliciosos)
 
-if prompt_input:
-    # 1. Extração segura de texto e múltiplos arquivos
-    if hasattr(prompt_input, "text"):
-        prompt_texto = prompt_input.text
-        arquivos = prompt_input.files if isinstance(prompt_input.files, list) else [prompt_input.files] if prompt_input.files else []
-    elif isinstance(prompt_input, dict):
-        prompt_texto = prompt_input.get("text", "")
-        arquivos_dict = prompt_input.get("files", [])
-        arquivos = arquivos_dict if isinstance(arquivos_dict, list) else [arquivos_dict] if arquivos_dict else []
-    else:
-        prompt_texto = str(prompt_input)
-        arquivos = []
+def codificar_imagem_base64(imagem_bytes: bytes) -> str:
+    """Converte bytes brutos da imagem em Base64 para envio multimodal."""
+    return base64.b64encode(imagem_bytes).decode("utf-8")
 
-    # Lê os bytes e nomes de todos os arquivos anexados
-    arquivos_processados = []
-    nomes_arquivos = []
-    if arquivos:
-        for arq in arquivos:
-            arquivos_processados.append({
-                "nome": arq.name,
-                "bytes": arq.getvalue(),
-                "tipo": arq.type
-            })
-            nomes_arquivos.append(arq.name)
+def extrair_texto_pdf(pdf_bytes: bytes) -> str:
+    """Extrai texto bruto de um arquivo PDF carregado em memória."""
+    try:
+        import fitz
+        texto_completo = ""
+        documento = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for pagina in documento:
+            texto_completo += pagina.get_text() + "\n"
+        return texto_completo.strip()
+    except Exception as e:
+        return f"[Erro ao processar PDF: Verifique se o PyMuPDF está instalado. Detalhe: {e}]"
 
-    if not prompt_texto and arquivos_processados:
-        prompt_texto = "Analise e descreva estes documentos em detalhes."
+def extrair_conteudo_tabela(arquivo_bytes: bytes, nome_arquivo: str) -> str:
+    """Extrai estrutura, metadados e amostras de dados de arquivos CSV ou Excel."""
+    try:
+        import pandas as pd
+        if nome_arquivo.lower().endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(arquivo_bytes))
+        elif nome_arquivo.lower().endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(io.BytesIO(arquivo_bytes))
+        else:
+            return ""
+        
+        info = (
+            f"Dimensões: {df.shape[0]} linhas x {df.shape[1]} colunas\n"
+            f"Colunas: {', '.join(df.columns.astype(str))}\n"
+            f"Tipos de Dados:\n{df.dtypes.to_string()}\n"
+            f"Amostra dos Dados (5 primeiras linhas):\n{df.head(5).to_string()}\n"
+        )
+        return info
+    except Exception as e:
+        return f"[Erro ao ler tabela de dados ({nome_arquivo}): {e}]"
 
-    txt_anexos = f"📄 [Anexos: {', '.join(nomes_arquivos)}]\n\n" if nomes_arquivos else ""
-    texto_usuario_salvar = f"{txt_anexos}{prompt_texto}"
+# =============================================================
+# 2. 🐍 CODE INTERPRETER & SANDBOX PYTHON LOCAL
+# =============================================================
 
-    # 2. Criação lazy da conversa no banco
-    if st.session_state.chat_atual_id is None:
-        titulo_chat = prompt_texto[:25] if prompt_texto else "Conversa Lume"
-        novo_id = criar_nova_conversa(titulo_chat)
-        st.session_state.chat_atual_id = novo_id
-
-    chat_id_ativo = int(st.session_state.chat_atual_id)
-
-    # 3. Salva e exibe a mensagem do usuário
-    salvar_mensagem(chat_id_ativo, "user", texto_usuario_salvar)
-
-    st.markdown(
-        f'<div style="display: flex; justify-content: flex-end; margin: 20px 0;"><div style="background-color: #282A2D; color: #E3E3E3; padding: 12px 20px; border-radius: 20px; max-width: 70%; font-size: 15px;">{texto_usuario_salvar}</div></div>', 
-        unsafe_allow_html=True
-    )
-
-    # 4. Cabeçalho de resposta do Lume
-    st.markdown("""
-        <div style="margin: 20px 0 4px 0; font-size: 13px; color: #8E918F; font-weight: 500;">
-            Lume
-        </div>
-    """, unsafe_allow_html=True)
-
-    status_placeholder = st.empty()
-    status_placeholder.markdown(HTML_PENSANDO, unsafe_allow_html=True)
+def executar_codigo_sandbox(codigo_python: str) -> dict:
+    """Executa scripts Python localmente capturando stdout, erros e gráficos matplotlib."""
+    os.makedirs("geracoes_lume", exist_ok=True)
+    output_buffer = io.StringIO()
+    caminho_grafico = None
     
-    def gerador_limpo_com_status():
-        primeiro_token = True
-        for chunk in processar_resposta_ia_stream(prompt_texto, str(chat_id_ativo), modo_raciocinio, anexos=arquivos_processados):
-            if chunk:
-                if primeiro_token:
-                    status_placeholder.empty()
-                    primeiro_token = False
-                yield chunk
-        if primeiro_token:
-            status_placeholder.empty()
+    # Remove blocos markdown e comandos de exibição interativa
+    cod_limpo = re.sub(r"^```(?:python)?\s*|\s*```$", "", codigo_python.strip(), flags=re.MULTILINE)
+    
+    namespace_global = {
+        "__builtins__": __builtins__,
+        "os": os,
+        "re": re,
+        "math": __import__("math"),
+        "datetime": datetime,
+        "time": time,
+        "json": json
+    }
+    
+    try:
+        import numpy as np
+        namespace_global["np"] = np
+        namespace_global["numpy"] = np
+    except ImportError:
+        pass
 
-    # 5. Consome streaming e calcula tempo
-    inicio = time.time()
-    resposta_gerada = st.write_stream(gerador_limpo_com_status)
-    tempo_total = time.time() - inicio
+    try:
+        import pandas as pd
+        namespace_global["pd"] = pd
+        namespace_global["pandas"] = pd
+    except ImportError:
+        pass
 
-    # 6. Salva no banco e atualiza a interface
-    texto_tempo = f"Processado em {tempo_total:.1f}s"
-    texto_final = limpar_vazamentos_llm(resposta_gerada)
-    salvar_mensagem(chat_id_ativo, "assistant", texto_final, texto_tempo)
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        
+        # Desativa a tentativa de abrir janelas GUI e evita conflito de warnings
+        plt.show = lambda *args, **kwargs: None
+        plt.clf()
+        plt.close('all')
+        
+        namespace_global["plt"] = plt
+        namespace_global["matplotlib"] = matplotlib
+    except ImportError:
+        plt = None
 
-    st.rerun()
+    try:
+        with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
+            exec(cod_limpo, namespace_global)
+        
+        if plt and len(plt.get_fignums()) > 0:
+            timestamp = int(time.time())
+            caminho_grafico = os.path.join("geracoes_lume", f"plot_{timestamp}.png")
+            plt.savefig(caminho_grafico, bbox_inches="tight", dpi=150)
+            plt.close('all')
+            
+        saida = output_buffer.getvalue().strip()
+        return {
+            "sucesso": True,
+            "saida": saida if saida else "[Execução concluída sem saídas de texto]",
+            "grafico": caminho_grafico
+        }
+    except Exception:
+        erro_trace = traceback.format_exc()
+        return {
+            "sucesso": False,
+            "saida": f"Erro de Execução:\n{erro_trace}",
+            "grafico": None
+        }
+
+# =============================================================
+# 3. 🌐 MOTOR DE BUSCA WEB RESILIENTE
+# =============================================================
+
+def otimizar_query_busca(prompt: str) -> tuple[str, bool]:
+    termo = prompt.lower()
+    
+    # Eleições e gatilhos factuais recentes forçados para a aba de notícias
+    termos_noticia = ["noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", "eleicao"]
+    eh_noticia = any(t in termo for t in termos_noticia)
+    
+    comandos_remover = [
+        "procure na internet sobre o", "procure na internet sobre a", "procure na internet sobre os", "procure na internet sobre as", "procure na internet sobre",
+        "pesquise na internet sobre o", "pesquise na internet sobre a", "pesquise na internet sobre",
+        "busque na internet sobre o", "busque na internet sobre a", "busque na internet sobre",
+        "procure na web sobre", "pesquise na web sobre", "busque na web sobre",
+        "procure na internet", "procure na web", "pesquise na internet", "pesquise na web",
+        "busque na internet", "busque na web", "procure sobre", "pesquise sobre", "busque sobre",
+        "quero saber mais sobre ele", "quero saber mais sobre ela", "quero saber mais sobre",
+        "quero saber sobre", "quero saber", "me diga sobre", "me fale sobre", "fale sobre",
+        "você pode procurar", "voce pode procurar", "você pode pesquisar", "voce pode pesquisar",
+        "quem e o", "quem é o", "quem e a", "quem é a", "quem e", "quem é", "o que e", "o que é",
+        "por favor", "gostaria de saber", "pesquisar", "procurar", "buscar", "lume", "online",
+        "ola", "olá", "oi", "bom dia", "boa tarde", "boa noite", "e ai", "e aí"
+    ]
+    
+    for cmd in comandos_remover:
+        termo = re.sub(rf'\b{re.escape(cmd)}\b', ' ', termo)
+    
+    termo = re.sub(r'[^\w\s]', ' ', termo)
+    termo = " ".join(termo.split())
+    
+    ano_atual = datetime.now().year
+    
+    if eh_noticia:
+        if not termo or any(t in termo for t in ["ultimas", "noticias"]):
+            return f"principais noticias brasil {ano_atual}", True
+        return f"{termo} {ano_atual}", True
+        
+    return (termo if termo else prompt), False
+
+def pesquisar_web_direta(query: str) -> str:
+    query_limpa, eh_noticia = otimizar_query_busca(query)
+    query_segura = mascarar_dados_sensiveis(query_limpa)
+
+    if eh_noticia:
+        try:
+            resultados_news = []
+            with DDGS(timeout=8) as ddgs:
+                busca_news = ddgs.news(query_segura, safesearch="moderate", max_results=5)
+                for r in busca_news:
+                    titulo = r.get('title', 'Sem título')
+                    conteudo = r.get('body', '')
+                    data_pub = r.get('date', '')
+                    if conteudo:
+                        tag_data = f" ({data_pub[:10]})" if data_pub else ""
+                        resultados_news.append(f"📰 **{titulo}**{tag_data}\n{conteudo}")
+            if resultados_news:
+                return "\n\n".join(resultados_news)
+        except Exception:
+            pass
+
+    try:
+        resultados_txt = []
+        with DDGS(timeout=8) as ddgs:
+            busca_txt = ddgs.text(query_segura, safesearch="moderate", max_results=6)
+            for r in busca_txt:
+                titulo = r.get('title', 'Sem título')
+                conteudo = r.get('body', '')
+                if conteudo and len(conteudo) > 20:
+                    resultados_txt.append(f"📌 **{titulo}**\n{conteudo}")
+        if resultados_txt:
+            return "\n\n".join(resultados_txt)
+    except Exception:
+        pass
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://lite.duckduckgo.com/"
+        }
+        resp = requests.post("https://lite.duckduckgo.com/lite/", data={"q": query_segura}, headers=headers, timeout=8)
+        if resp.status_code == 200 and BeautifulSoup:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            snippets = []
+            links = soup.find_all("a", class_="result-link")
+            corpos = soup.find_all("td", class_="result-snippet")
+            for link, corpo in zip(links[:5], corpos[:5]):
+                t = link.get_text().strip()
+                c = corpo.get_text().strip()
+                if c:
+                    snippets.append(f"📌 **{t}**\n{c}")
+            if snippets:
+                return "\n\n".join(snippets)
+    except Exception:
+        pass
+
+    try:
+        wiki_url = f"https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
+        r_wiki = requests.get(wiki_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
+        if r_wiki.status_code == 200:
+            wiki_data = r_wiki.json().get("query", {}).get("search", [])
+            if wiki_data:
+                wiki_res = []
+                for w in wiki_data[:3]:
+                    t_w = w.get("title", "")
+                    s_w = re.sub(r'<.*?>', '', w.get("snippet", ""))
+                    if s_w:
+                        wiki_res.append(f"📚 **Wikipédia ({t_w})**\n{s_w}...")
+                if wiki_res:
+                    return "\n\n".join(wiki_res)
+    except Exception:
+        pass
+
+    # Fallback injetado no contexto em caso de Rate Limit (Shadowban)
+    return "⚠️ A busca na internet falhou por excesso de requisições ou bloqueio do servidor. Avise o usuário de forma natural que você tentou pesquisar, mas o motor de busca está temporariamente indisponível."
+
+# =============================================================
+# 4. 🎨 MOTOR DE GERAÇÃO E AUTOAVALIAÇÃO VISUAL (DIFFUSION + VLM)
+# =============================================================
+
+def limpar_texto_geracao(prompt: str) -> str:
+    """Remove comandos em português e negações que induzem pessoas na cena."""
+    p = prompt.lower()
+    termos_remover = [
+        "gere uma imagem de um", "gere uma imagem de uma", "gere uma imagem de", "gere uma imagem",
+        "crie uma imagem de um", "crie uma imagem de uma", "crie uma imagem de", "crie uma imagem",
+        "faça uma imagem de você mesmo usando essa como base", "faça uma imagem de você mesmo",
+        "faça uma imagem de", "faça uma imagem", "faca uma imagem", "faça um desenho de", "faça um desenho",
+        "gere uma foto de um", "gere uma foto de uma", "gere uma foto de", "gere uma foto",
+        "desenhe um", "desenhe uma", "desenhe", "ilustre",
+        "sem ninguem", "sem pessoas", "somente o", "somente a", "apenas o", "apenas a"
+    ]
+    for termo in termos_remover:
+        p = re.sub(rf'\b{re.escape(termo)}\b', ' ', p)
+    return " ".join(p.split())
+
+def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prompt_en: str, id_modelo: str) -> str:
+    """Analisa a imagem gerada via VLM e grava os aprendizados de estilo no ChromaDB."""
+    try:
+        if not os.path.exists(caminho_imagem):
+            return ""
+
+        with open(caminho_imagem, "rb") as f:
+            b64_img = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt_critico = (
+            f"Você é o crítico de arte do Lume. Avalie esta imagem gerada para a diretriz: '{prompt_usuario}'. "
+            f"Responda em no máximo 2 frases em português dizendo o que ficou bom em termos de iluminação, "
+            f"enquadramento e fidelidade temática."
+        )
+
+        res = client_local.chat.completions.create(
+            model=id_modelo,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_critico},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]
+            }],
+            max_tokens=80,
+            timeout=15.0
+        )
+
+        critica = res.choices[0].message.content.strip()
+        
+        if critica and "⚠️" not in critica:
+            fato_aprendizado = f"Estilo e composição visual bem-sucedidos para '{prompt_usuario}': prompt usado ('{prompt_en}'). Análise: {critica}"
+            salvar_memoria(fato_aprendizado, usuario="lume_vision_critic")
+
+        return critica
+    except Exception as e:
+        print(f"⚠️ Crítico visual indisponível ou timeout: {e}")
+        return ""
+
+def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None) -> str:
+    """Consulta memórias passadas, traduz o prompt (ou analisa imagem base), sintetiza a imagem e autoavalia."""
+    os.makedirs("geracoes_lume", exist_ok=True)
+    
+    termo_limpo = limpar_texto_geracao(prompt_usuario)
+    if not termo_limpo.strip() and not imagem_referencia_bytes:
+        termo_limpo = "lume artificial intelligence neural sphere glowing"
+
+    memoria_estilo = consultar_memoria(f"Estilo e composição visual para '{termo_limpo}'")
+    contexto_memoria = f"\nUse estes aprendizados prévios de estilo: {memoria_estilo[:200]}" if memoria_estilo else ""
+
+    prompt_en = termo_limpo
+
+    try:
+        if imagem_referencia_bytes:
+            b64_ref = codificar_imagem_base64(imagem_referencia_bytes)
+            conteudo_msg = [
+                {
+                    "type": "text", 
+                    "text": (
+                        f"Analyze this reference image and the user directive: '{prompt_usuario}'. "
+                        f"Extract its visual style, colors, lighting, and subject to create a concise, high quality "
+                        f"English descriptive diffusion prompt that recreates/evolves this concept. "
+                        f"Return ONLY the English prompt text."
+                    )
+                },
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_ref}"}}
+            ]
+        else:
+            conteudo_msg = (
+                f"Translate the following subject into a concise English descriptive prompt for an image generator. "
+                f"Include the subject and high quality visual tags (lighting, focus, angle). "
+                f"Never include humans or portraits unless explicitly requested.{contexto_memoria}\n\n"
+                f"Subject: '{termo_limpo}'\n\nPrompt:"
+            )
+
+        res = client_local.chat.completions.create(
+            model=id_modelo,
+            messages=[{"role": "user", "content": conteudo_msg}],
+            max_tokens=60,
+            timeout=15.0
+        )
+        conteudo = res.choices[0].message.content.strip().replace('"', '').replace("'", "")
+        if conteudo:
+            prompt_en = conteudo
+    except Exception:
+        dicionario_rapido = {
+            "piano": "grand piano in a room, aesthetic lighting, photorealistic, 8k", 
+            "gato": "cute domestic cat, detailed fur, studio lighting, highly detailed", 
+            "carro": "modern sports car, cinematic shot, 8k",
+            "lume": "glowing golden neural AI core, futuristic energy sphere, digital particles, dark background, 8k"
+        }
+        for k, v in dicionario_rapido.items():
+            if k in prompt_usuario.lower():
+                prompt_en = v
+                break
+
+    print(f"\n🎨 [Difusão] Prompt gerado: '{prompt_en}'")
+
+    caminho_salvo = ""
+    try:
+        timestamp = int(time.time())
+        semente_aleatoria = random.randint(1, 999999)
+        prompt_codificado = urllib.parse.quote(prompt_en)
+        url_imagem = f"https://image.pollinations.ai/prompt/{prompt_codificado}?width=1024&height=1024&nologo=true&seed={semente_aleatoria}"
+        
+        resp_img = requests.get(url_imagem, timeout=30)
+        if resp_img.status_code == 200:
+            caminho_salvo = os.path.join("geracoes_lume", f"img_{timestamp}.png")
+            with open(caminho_salvo, "wb") as f:
+                f.write(resp_img.content)
+        else:
+            return f"🎨 Imagem sintetizada com base na sua diretriz visual!\n\n[IMAGEM_GERADA:{url_imagem}]"
+    except Exception as e:
+        return f"⚠️ Falha na geração de imagem: {e}."
+
+    critica_visual = autoavaliar_e_aprender_imagem(caminho_salvo, termo_limpo, prompt_en, id_modelo)
+    feedback_txt = f"\n\n🔍 **Autoavaliação Lume:** {critica_visual}" if critica_visual else ""
+
+    return f"🎨 Imagem sintetizada com base na sua diretriz visual!{feedback_txt}\n\n[IMAGEM_GERADA:{caminho_salvo}]"
+
+# =============================================================
+# 5. 🧠 ROTEADOR DE INTENÇÕES INTELIGENTE (FUNCTION CALLING)
+# =============================================================
+
+def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bool) -> dict:
+    """Usa o LLM como um roteador de ferramentas com prioridade estrita."""
+    
+    if tem_anexos and not prompt.strip():
+        return {"intencao": "DIRETO", "parametros": {}}
+
+    prompt_roteador = f"""Você é o roteador central do Lume. Analise a mensagem do usuário e decida qual ferramenta utilizar.
+Responda APENAS com um JSON puro, sem formatação markdown e sem texto adicional.
+
+Regras de Classificação:
+1. "EXECUTAR_CODIGO": Use SEMPRE que envolver scripts, programação, Python, matemática exata, simulação, manipulação de dados/planilhas ou plotar/gerar gráficos via matplotlib/código.
+2. "GERAR_IMAGEM": Use APENAS quando o usuário pedir arte visual, fotos, pinturas, ilustrações conceituais ou renderizações de difusão (sem código).
+3. "BUSCA_WEB": Se o usuário pedir notícias, tempo/clima, cotações ou pesquisas na internet em tempo real.
+4. "MEMORIA_PESSOAL": Se o usuário perguntar sobre o Gabriel (Biel), histórico pessoal ou perfil do criador.
+5. "SALVAR_MEMORIA": Se o usuário pedir para lembrar, guardar, salvar ou anotar um fato permanentemente.
+6. "SAUDACAO": Cumprimentos rápidos (oi, olá, bom dia).
+7. "DIRETO": Dúvidas gerais, raciocínio puramente textual ou conversas livres.
+
+Mensagem do usuário: "{prompt}"
+
+Formato esperado:
+{{"intencao": "NOME_DA_FERRAMENTA", "parametros": {{"query": "texto ou vazio"}}}}
+"""
+    try:
+        res = client_local.chat.completions.create(
+            model=id_modelo,
+            messages=[{"role": "user", "content": prompt_roteador}],
+            temperature=0.0,
+            max_tokens=50,
+            timeout=15.0
+        )
+        resposta_json = res.choices[0].message.content.strip()
+        resposta_json = resposta_json.replace("```json", "").replace("```", "").strip()
+        dados = json.loads(resposta_json)
+        
+        intencao = dados.get("intencao", "DIRETO")
+        return {"intencao": intencao, "parametros": dados.get("parametros", {})}
+    except Exception as e:
+        print(f"⚠️ Fallback do roteador ativado: {e}")
+        p = prompt.lower()
+        
+        gatilhos_codigo = ["python", "código", "codigo", "script", "plot", "plote", "gráfico", "grafico", "matplotlib", "seaborn", "calcule", "simule", "dataframe", "csv", "excel", "planilha"]
+        if any(c in p for c in gatilhos_codigo): 
+            return {"intencao": "EXECUTAR_CODIGO", "parametros": {}}
+        
+        gatilhos_imagem = [
+            "gere uma imagem", "gerar imagem", "crie uma imagem", "criar imagem", 
+            "faça uma imagem", "desenhe", "ilustre", "ilustrar", "visualizar como", 
+            "renderize uma imagem", "foto realista", "arte digital", "usando essa como base"
+        ]
+        if any(g in p for g in gatilhos_imagem): 
+            return {"intencao": "GERAR_IMAGEM", "parametros": {}}
+
+        gatilhos_salvar = ["armazene", "guarde", "lembre", "salve", "memorize", "anote", "gravar na memória"]
+        if any(g in p for g in gatilhos_salvar): 
+            return {"intencao": "SALVAR_MEMORIA", "parametros": {}}
+        
+        gatilhos_memoria = ["sobre o biel", "sobre o gabriel", "sobre seu criador", "quem sou eu", "meu nome", "minhas preferências", "quem te criou"]
+        if any(m in p for m in gatilhos_memoria): 
+            return {"intencao": "MEMORIA_PESSOAL", "parametros": {}}
+        
+        gatilhos_web = ["busque", "pesquise", "procure na web", "na internet", "previsão", "clima", "tempo hoje", "notícias"]
+        if any(g in p for g in gatilhos_web): 
+            return {"intencao": "BUSCA_WEB", "parametros": {}}
+        
+        cumprimentos = ["oi", "ola", "olá", "boa noite", "bom dia", "boa tarde", "e ai", "e aí"]
+        if p in cumprimentos or (len(p.split()) <= 2 and any(c in p for c in cumprimentos)): 
+            return {"intencao": "SAUDACAO", "parametros": {}}
+        
+        return {"intencao": "DIRETO", "parametros": {}}
+
+# =============================================================
+# 6. ⚙️ SELEÇÃO DINÂMICA DE MODELOS (API GEMINI + FALLBACK)
+# =============================================================
+
+def obter_modelo_para_modo(modo: str, tem_imagem: bool = False) -> str:
+    """Seleciona o modelo da família Gemini 2.5 quando há chave ou usa o modelo gratuito padrão."""
+    if not obter_chave_gemini():
+        return "openai"
+    if tem_imagem:
+        return "gemini-2.5-flash"
+    if "Ultra Flash" in modo:
+        return "gemini-2.5-flash-lite"
+    elif "Pensamento Profundo" in modo:
+        return "gemini-2.5-pro"
+    return "gemini-2.5-flash"
+
+def gerar_micro_resumo(contexto_historico: str, id_modelo: str) -> str:
+    """Gera um resumo semântico curto para arquivamento no ChromaDB."""
+    try:
+        res = client_local.chat.completions.create(
+            model=id_modelo,
+            messages=[{"role": "user", "content": f"Sintetize em 1 frase curta o tópico desta conversa:\n\n{contexto_historico}\n\nResumo:"}],
+            max_tokens=50,
+            timeout=10.0
+        )
+        return res.choices[0].message.content.strip()
+    except Exception:
+        return ""
+
+# =============================================================
+# 7. ⚡ EXECUTOR HÍBRIDO EM STREAMING (MULTIMODAL 2-PASSOS)
+# =============================================================
+
+# Memória temporária em RAM para respostas rápidas e contingência da sessão
+CACHE_RESPOSTAS_TEMP = {}
+
+def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list) -> str:
+    """Aciona LLM secundário gratuito ou responde usando a memória local/temporária se a API principal falhar."""
+    # 1. Tenta LLM de contingência gratuito (não requer chave de API)
+    try:
+        res_backup = requests.post(
+            "https://text.pollinations.ai/openai",
+            json={"model": "openai", "messages": messages, "temperature": 0.7},
+            timeout=15
+        )
+        if res_backup.status_code == 200:
+            conteudo = res_backup.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            if conteudo:
+                CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = conteudo
+                return conteudo
+    except Exception:
+        pass
+
+    # 2. Consulta o cache temporário da sessão
+    chave_prompt = prompt.lower().strip()
+    if chave_prompt in CACHE_RESPOSTAS_TEMP:
+        return CACHE_RESPOSTAS_TEMP[chave_prompt]
+
+    # 3. Síntese local usando ChromaDB, Web e Anexos já coletados
+    if intencao == "SAUDACAO":
+        return "Olá! Tudo ótimo por aqui. Como posso ajudar você hoje?"
+    if intencao == "SALVAR_MEMORIA":
+        return "Informação registrada com sucesso na minha memória permanente (ChromaDB)! Vou me lembrar disso."
+    if contexto_anexos:
+        return f"Analisei os documentos anexados localmente. Aqui estão as informações extraídas:\n\n{contexto_anexos}"
+    if contexto_web and "⚠️" not in contexto_web:
+        return f"Aqui estão as informações mais recentes que encontrei na web:\n\n{contexto_web}"
+    if memoria_vetorial:
+        return f"Consultando minha memória vetorial (ChromaDB), encontrei estes registros sobre o assunto:\n\n{memoria_vetorial}"
+
+    busca_emergencia = consultar_memoria(prompt)
+    if busca_emergencia:
+        return f"Com base nos registros salvos na minha memória:\n\n{busca_emergencia}"
+
+    return "No momento o servidor principal está com alta demanda, mas minha memória vetorial, busca web e leitor de documentos seguem ativos. Pode reformular ou enviar os dados que deseja analisar!"
+
+def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexos: list = None):
+    """Executa o pipeline multimodal em 2 passos com suporte a Sandbox Python, PDFs, Dados e Imagens."""
+    if verificar_injecao_prompt(prompt):
+        yield "⚠️ **Alerta de Segurança:** Diretriz de proteção ativada contra comandos maliciosos."
+        return
+
+    anexos = anexos or []
+    tem_pdf = any("pdf" in a.get("tipo", "") for a in anexos)
+    tem_imagem = any("image" in a.get("tipo", "") for a in anexos)
+    tem_tabela = any(a.get("nome", "").lower().endswith(('.csv', '.xls', '.xlsx')) for a in anexos)
+    
+    id_modelo_raciocinio = obter_modelo_para_modo(modo, tem_imagem=False)
+    id_modelo_visao = obter_modelo_para_modo(modo, tem_imagem=True)
+
+    decisao_llm = classificar_intencao_inteligente(prompt, id_modelo_raciocinio, tem_anexos=bool(anexos))
+    intencao = decisao_llm["intencao"]
+
+    # Geração de Imagem
+    if intencao == "GERAR_IMAGEM" and not tem_pdf:
+        imagem_referencia_bytes = next((a["bytes"] for a in anexos if "image" in a.get("tipo", "")), None)
+        yield "🎨 Analisando diretrizes e sintetizando imagem...\n\n"
+        id_modelo_geracao = id_modelo_visao if imagem_referencia_bytes else id_modelo_raciocinio
+        resultado_img = gerar_imagem_local(prompt, id_modelo_geracao, imagem_referencia_bytes=imagem_referencia_bytes)
+        yield resultado_img
+        return
+
+    contexto_anexos = ""
+    
+    # ---------------------------------------------------------
+    # PASSO 1: EXTRAÇÃO DE DADOS (VISÃO, TABELAS E PDF)
+    # ---------------------------------------------------------
+    if anexos:
+        yield "🔍 Lendo documentos e extraindo contexto...\n\n"
+        
+        for arq in anexos:
+            nome_arq = arq.get("nome", "")
+            tipo_arq = arq.get("tipo", "")
+            
+            if "pdf" in tipo_arq:
+                texto_pdf = extrair_texto_pdf(arq["bytes"])
+                contexto_anexos += f"\n--- CONTEÚDO DO PDF ({nome_arq}) ---\n{texto_pdf[:4000]}...\n"
+            
+            elif nome_arq.lower().endswith(('.csv', '.xls', '.xlsx')):
+                texto_tabela = extrair_conteudo_tabela(arq["bytes"], nome_arq)
+                contexto_anexos += f"\n--- DADOS DA TABELA/PLANILHA ({nome_arq}) ---\n{texto_tabela}\n"
+
+            elif "image" in tipo_arq:
+                img_b64 = codificar_imagem_base64(arq["bytes"])
+                try:
+                    res_visao = client_local.chat.completions.create(
+                        model=id_modelo_visao,
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": "Descreva esta imagem em detalhes absolutos. Extraia todos os textos, dados, cores e formas. Não tire conclusões, apenas relate objetivamente o que vê."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                        ]}],
+                        max_tokens=300,
+                        timeout=20.0
+                    )
+                    desc_img = res_visao.choices[0].message.content.strip()
+                    contexto_anexos += f"\n--- DESCRIÇÃO DA IMAGEM ({nome_arq}) ---\n{desc_img}\n"
+                except Exception as e:
+                    contexto_anexos += f"\n[Falha ao ler a imagem {nome_arq}: {e}]\n"
+
+    # ---------------------------------------------------------
+    # PASSO 2: RACIOCÍNIO CENTRAL E EXECUÇÃO (MODELO PRINCIPAL)
+    # ---------------------------------------------------------
+    mensagens_anteriores = carregar_mensagens(conversa_id)[-6:]
+    data_hoje = datetime.now().strftime("%d/%m/%Y")
+
+    if intencao == "SALVAR_MEMORIA":
+        salvar_memoria(f"Fato explícito salvo a pedido do Gabriel: {prompt}", usuario="padrao")
+
+    contexto_web = pesquisar_web_direta(prompt) if intencao == "BUSCA_WEB" and not anexos else ""
+    memoria_vetorial = ""
+    resumos_outros_chats = ""
+
+    if intencao in ["MEMORIA_PESSOAL", "SALVAR_MEMORIA"]:
+        query_memoria = f"{prompt} Gabriel Biel criador fatos preferências projetos perfil"
+        memoria_vetorial = consultar_memoria(query_memoria)
+        resumos_outros_chats = consultar_resumos_chats(query_memoria, chat_id_atual=conversa_id)
+
+    # AQUI ESTÁ A CORREÇÃO PRINCIPAL DA IDENTIDADE E MEMÓRIA
+    partes_sistema = [
+        f"Você é o Lume, assistente inteligente criado pelo Gabriel (Biel). Hoje é {data_hoje}.",
+        "Responda sempre em português do Brasil com clareza, riqueza de detalhes e naturalidade.",
+        "⚠️ DIRETRIZ DE IDENTIDADE: NUNCA diga que você é 'um modelo de linguagem', que foi treinado por uma empresa, que possui 'data de corte de conhecimento' ou que não tem acesso à internet. Assuma 100% a sua identidade como Lume. Se uma pesquisa falhar, diga apenas que sua conexão com o servidor falhou.",
+        "⚠️ DIRETRIZ CRÍTICA DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura que serve como memória infinita e permanente. Você PODE SIM salvar, aprender e lembrar de qualquer informação de usuários ou amigos para o futuro. NUNCA diga que não tem memória, que apaga dados após a sessão ou que tem limitações de privacidade. Apenas confirme calorosamente que a informação foi gravada na sua memória.",
+        "Diretrizes de Operação:",
+        "- Em cumprimentos e saudações, responda em 1 linha.",
+        "- Se for solicitado cálculos complexos, análise de dados ou geração de gráficos, forneça o script Python executável dentro de um bloco ```python ... ```.",
+        "- Se houver dados de imagens, planilhas ou PDFs extraídos abaixo, aja como se VOCÊ tivesse lido os documentos e integre essas informações no seu raciocínio final.",
+        "- Se houver dados da web abaixo, utilize-os para enriquecer a resposta.",
+        "- Caso os dados não estejam presentes, responda utilizando seu conhecimento geral."
+    ]
+
+    if contexto_web:
+        partes_sistema.append(f"\n--- INFORMAÇÕES OBTIDAS NA WEB ---\n{contexto_web}")
+    if memoria_vetorial:
+        partes_sistema.append(f"\n--- FATOS DA MEMÓRIA ---\n{memoria_vetorial}")
+    if resumos_outros_chats:
+        partes_sistema.append(f"\n--- HISTÓRICO RELEVANTE ---\n{resumos_outros_chats}")
+    if contexto_anexos:
+        partes_sistema.append(f"\n--- DADOS EXTRAÍDOS DOS ANEXOS ---\n{contexto_anexos}")
+
+    messages = [{"role": "system", "content": "\n".join(partes_sistema)}]
+
+    for a, t, _ in mensagens_anteriores:
+        messages.append({"role": "user" if a == "user" else "assistant", "content": t})
+
+    messages.append({"role": "user", "content": prompt if prompt.strip() else "Analise os anexos extraídos."})
+
+    resposta_acumulada = ""
+    try:
+        stream = client_local.chat.completions.create(
+            model=id_modelo_raciocinio,
+            messages=messages,
+            temperature=0.7,
+            stream=True
+        )
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                token = chunk.choices[0].delta.content
+                resposta_acumulada += token
+                yield token
+        if resposta_acumulada:
+            CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
+            
+    except Exception as e:
+        print(f"⚠️ API principal oscilou ({e}). Acionando memória de contingência...")
+        resposta_fallback = gerar_resposta_contingencia(
+            prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages
+        )
+        resposta_acumulada = resposta_fallback
+        yield resposta_fallback
+
+    # Interceptação e execução automática pelo Code Interpreter se houver bloco Python gerado
+    if "```python" in resposta_acumulada and (intencao == "EXECUTAR_CODIGO" or tem_tabela):
+        try:
+            codigos_encontrados = re.findall(r"```(?:python)?\s*(.*?)\s*```", resposta_acumulada, re.DOTALL)
+            if codigos_encontrados:
+                yield "\n\n⚙️ **Executando código no Code Interpreter Sandbox...**\n"
+                codigo_alvo = codigos_encontrados[-1]
+                resultado_sandbox = executar_codigo_sandbox(codigo_alvo)
+                
+                saida_formatada = f"\n**Resultado da Execução:**\n```text\n{resultado_sandbox['saida']}\n```"
+                resposta_acumulada += saida_formatada
+                yield saida_formatada
+                
+                if resultado_sandbox.get("grafico"):
+                    tag_img = f"\n\n[IMAGEM_GERADA:{resultado_sandbox['grafico']}]"
+                    resposta_acumulada += tag_img
+                    yield tag_img
+        except Exception as e:
+            print(f"⚠️ Falha no Code Interpreter pós-processamento: {e}")
+
+    if intencao == "BUSCA_WEB" and not anexos and resposta_acumulada and "⚠️" not in resposta_acumulada:
+        termos_efemeros = ["tempo", "previsão", "clima", "cotação", "hoje", "notícia", "notícias"]
+        if not any(t in prompt.lower() for t in termos_efemeros):
+            salvar_memoria(f"Conhecimento adquirido sobre '{prompt}': {resposta_acumulada[:300]}...", usuario="padrao")
+
+    if resposta_acumulada and "⚠️" not in resposta_acumulada:
+        resumo = gerar_micro_resumo(f"Usuário: {prompt}\nLume: {resposta_acumulada}", id_modelo_raciocinio)
+        if resumo:
+            salvar_ou_atualizar_resumo_chat(conversa_id, f"Chat {conversa_id}: {resumo}")
