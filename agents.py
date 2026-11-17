@@ -14,6 +14,7 @@ import requests
 import traceback
 import contextlib
 import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from openai import OpenAI
 
@@ -160,7 +161,6 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
     output_buffer = io.StringIO()
     caminho_grafico = None
     
-    # Remove blocos markdown e comandos de exibição interativa
     cod_limpo = re.sub(r"^```(?:python)?\s*|\s*```$", "", codigo_python.strip(), flags=re.MULTILINE)
     
     namespace_global = {
@@ -192,7 +192,6 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         
-        # Desativa a tentativa de abrir janelas GUI e evita conflito de warnings
         plt.show = lambda *args, **kwargs: None
         plt.clf()
         plt.close('all')
@@ -227,14 +226,17 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         }
 
 # =============================================================
-# 3. 🌐 MOTOR DE BUSCA WEB RESILIENTE
+# 3. 🌐 MOTOR DE BUSCA WEB RESILIENTE (COM GOOGLE NEWS RSS)
 # =============================================================
 
 def otimizar_query_busca(prompt: str) -> tuple[str, bool]:
     termo = prompt.lower()
     
-    # Eleições e gatilhos factuais recentes forçados para a aba de notícias
-    termos_noticia = ["noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", "eleicao"]
+    termos_noticia = [
+        "noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", 
+        "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", 
+        "eleicao", "presidente", "ganhou", "venceu", "resultado", "2026", "2025"
+    ]
     eh_noticia = any(t in termo for t in termos_noticia)
     
     comandos_remover = [
@@ -247,7 +249,6 @@ def otimizar_query_busca(prompt: str) -> tuple[str, bool]:
         "quero saber mais sobre ele", "quero saber mais sobre ela", "quero saber mais sobre",
         "quero saber sobre", "quero saber", "me diga sobre", "me fale sobre", "fale sobre",
         "você pode procurar", "voce pode procurar", "você pode pesquisar", "voce pode pesquisar",
-        "quem e o", "quem é o", "quem e a", "quem é a", "quem e", "quem é", "o que e", "o que é",
         "por favor", "gostaria de saber", "pesquisar", "procurar", "buscar", "lume", "online",
         "ola", "olá", "oi", "bom dia", "boa tarde", "boa noite", "e ai", "e aí"
     ]
@@ -263,7 +264,9 @@ def otimizar_query_busca(prompt: str) -> tuple[str, bool]:
     if eh_noticia:
         if not termo or any(t in termo for t in ["ultimas", "noticias"]):
             return f"principais noticias brasil {ano_atual}", True
-        return f"{termo} {ano_atual}", True
+        if str(ano_atual) not in termo:
+            return f"{termo} brasil {ano_atual}", True
+        return f"{termo} brasil", True
         
     return (termo if termo else prompt), False
 
@@ -271,6 +274,26 @@ def pesquisar_web_direta(query: str) -> str:
     query_limpa, eh_noticia = otimizar_query_busca(query)
     query_segura = mascarar_dados_sensiveis(query_limpa)
 
+    # 1. Google News RSS (Imune a bloqueio de IP em nuvem no Streamlit Cloud)
+    try:
+        rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query_segura)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+        r_rss = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r_rss.status_code == 200:
+            root = ET.fromstring(r_rss.content)
+            noticias_rss = []
+            for item in root.findall(".//item")[:6]:
+                titulo = item.findtext("title") or ""
+                pub_date = item.findtext("pubDate") or ""
+                fonte = item.findtext("source") or "Notícia"
+                if titulo:
+                    data_curta = f" ({pub_date[:16]})" if pub_date else ""
+                    noticias_rss.append(f"📰 **{titulo}** — *{fonte}*{data_curta}")
+            if noticias_rss:
+                return "\n\n".join(noticias_rss)
+    except Exception:
+        pass
+
+    # 2. DuckDuckGo News
     if eh_noticia:
         try:
             resultados_news = []
@@ -288,6 +311,7 @@ def pesquisar_web_direta(query: str) -> str:
         except Exception:
             pass
 
+    # 3. DuckDuckGo Text
     try:
         resultados_txt = []
         with DDGS(timeout=8) as ddgs:
@@ -302,27 +326,7 @@ def pesquisar_web_direta(query: str) -> str:
     except Exception:
         pass
 
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://lite.duckduckgo.com/"
-        }
-        resp = requests.post("https://lite.duckduckgo.com/lite/", data={"q": query_segura}, headers=headers, timeout=8)
-        if resp.status_code == 200 and BeautifulSoup:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            snippets = []
-            links = soup.find_all("a", class_="result-link")
-            corpos = soup.find_all("td", class_="result-snippet")
-            for link, corpo in zip(links[:5], corpos[:5]):
-                t = link.get_text().strip()
-                c = corpo.get_text().strip()
-                if c:
-                    snippets.append(f"📌 **{t}**\n{c}")
-            if snippets:
-                return "\n\n".join(snippets)
-    except Exception:
-        pass
-
+    # 4. Wikipédia API em Português
     try:
         wiki_url = f"https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
         r_wiki = requests.get(wiki_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
@@ -340,8 +344,7 @@ def pesquisar_web_direta(query: str) -> str:
     except Exception:
         pass
 
-    # Fallback injetado no contexto em caso de Rate Limit (Shadowban)
-    return "⚠️ A busca na internet falhou por excesso de requisições ou bloqueio do servidor. Avise o usuário de forma natural que você tentou pesquisar, mas o motor de busca está temporariamente indisponível."
+    return "⚠️ A busca na internet não retornou registros verificados para esta consulta específica no momento."
 
 # =============================================================
 # 4. 🎨 MOTOR DE GERAÇÃO E AUTOAVALIAÇÃO VISUAL (DIFFUSION + VLM)
@@ -488,10 +491,21 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
 # =============================================================
 
 def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bool) -> dict:
-    """Usa o LLM como um roteador de ferramentas com prioridade estrita."""
+    """Usa o LLM como um roteador de ferramentas com prioridade estrita e checagem factual."""
     
     if tem_anexos and not prompt.strip():
         return {"intencao": "DIRETO", "parametros": {}}
+
+    p = prompt.lower().strip()
+
+    # Prioridade 1: Gatilhos diretos de eventos recentes/fatos da web (evita que o LLM pule a busca)
+    gatilhos_forcar_web = [
+        "eleições", "eleicao", "eleito", "presidente", "quem ganhou", "quem venceu",
+        "2025", "2026", "notícias", "noticia", "ultimas", "últimas", "clima", "previsão",
+        "tempo hoje", "cotação", "dólar", "bitcoin", "pesquise", "busque", "procure na web", "na internet"
+    ]
+    if any(g in p for g in gatilhos_forcar_web):
+        return {"intencao": "BUSCA_WEB", "parametros": {"query": prompt}}
 
     prompt_roteador = f"""Você é o roteador central do Lume. Analise a mensagem do usuário e decida qual ferramenta utilizar.
 Responda APENAS com um JSON puro, sem formatação markdown e sem texto adicional.
@@ -499,11 +513,11 @@ Responda APENAS com um JSON puro, sem formatação markdown e sem texto adiciona
 Regras de Classificação:
 1. "EXECUTAR_CODIGO": Use SEMPRE que envolver scripts, programação, Python, matemática exata, simulação, manipulação de dados/planilhas ou plotar/gerar gráficos via matplotlib/código.
 2. "GERAR_IMAGEM": Use APENAS quando o usuário pedir arte visual, fotos, pinturas, ilustrações conceituais ou renderizações de difusão (sem código).
-3. "BUSCA_WEB": Se o usuário pedir notícias, tempo/clima, cotações ou pesquisas na internet em tempo real.
+3. "BUSCA_WEB": Se o usuário perguntar sobre acontecimentos recentes, política, esportes, notícias, tempo/clima, cotações ou pesquisas na internet.
 4. "MEMORIA_PESSOAL": Se o usuário perguntar sobre o Gabriel (Biel), histórico pessoal ou perfil do criador.
 5. "SALVAR_MEMORIA": Se o usuário pedir para lembrar, guardar, salvar ou anotar um fato permanentemente.
 6. "SAUDACAO": Cumprimentos rápidos (oi, olá, bom dia).
-7. "DIRETO": Dúvidas gerais, raciocínio puramente textual ou conversas livres.
+7. "DIRETO": Dúvidas conceituais teóricas ou conversas livres.
 
 Mensagem do usuário: "{prompt}"
 
@@ -526,7 +540,6 @@ Formato esperado:
         return {"intencao": intencao, "parametros": dados.get("parametros", {})}
     except Exception as e:
         print(f"⚠️ Fallback do roteador ativado: {e}")
-        p = prompt.lower()
         
         gatilhos_codigo = ["python", "código", "codigo", "script", "plot", "plote", "gráfico", "grafico", "matplotlib", "seaborn", "calcule", "simule", "dataframe", "csv", "excel", "planilha"]
         if any(c in p for c in gatilhos_codigo): 
@@ -547,10 +560,6 @@ Formato esperado:
         gatilhos_memoria = ["sobre o biel", "sobre o gabriel", "sobre seu criador", "quem sou eu", "meu nome", "minhas preferências", "quem te criou"]
         if any(m in p for m in gatilhos_memoria): 
             return {"intencao": "MEMORIA_PESSOAL", "parametros": {}}
-        
-        gatilhos_web = ["busque", "pesquise", "procure na web", "na internet", "previsão", "clima", "tempo hoje", "notícias"]
-        if any(g in p for g in gatilhos_web): 
-            return {"intencao": "BUSCA_WEB", "parametros": {}}
         
         cumprimentos = ["oi", "ola", "olá", "boa noite", "bom dia", "boa tarde", "e ai", "e aí"]
         if p in cumprimentos or (len(p.split()) <= 2 and any(c in p for c in cumprimentos)): 
@@ -591,16 +600,14 @@ def gerar_micro_resumo(contexto_historico: str, id_modelo: str) -> str:
 # 7. ⚡ EXECUTOR HÍBRIDO EM STREAMING (MULTIMODAL 2-PASSOS)
 # =============================================================
 
-# Memória temporária em RAM para respostas rápidas e contingência da sessão
 CACHE_RESPOSTAS_TEMP = {}
 
 def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list) -> str:
     """Aciona LLM secundário gratuito ou responde usando a memória local/temporária se a API principal falhar."""
-    # 1. Tenta LLM de contingência gratuito (não requer chave de API)
     try:
         res_backup = requests.post(
             "https://text.pollinations.ai/openai",
-            json={"model": "openai", "messages": messages, "temperature": 0.7},
+            json={"model": "openai", "messages": messages, "temperature": 0.3},
             timeout=15
         )
         if res_backup.status_code == 200:
@@ -611,12 +618,10 @@ def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, m
     except Exception:
         pass
 
-    # 2. Consulta o cache temporário da sessão
     chave_prompt = prompt.lower().strip()
     if chave_prompt in CACHE_RESPOSTAS_TEMP:
         return CACHE_RESPOSTAS_TEMP[chave_prompt]
 
-    # 3. Síntese local usando ChromaDB, Web e Anexos já coletados
     if intencao == "SAUDACAO":
         return "Olá! Tudo ótimo por aqui. Como posso ajudar você hoje?"
     if intencao == "SALVAR_MEMORIA":
@@ -651,7 +656,6 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     decisao_llm = classificar_intencao_inteligente(prompt, id_modelo_raciocinio, tem_anexos=bool(anexos))
     intencao = decisao_llm["intencao"]
 
-    # Geração de Imagem
     if intencao == "GERAR_IMAGEM" and not tem_pdf:
         imagem_referencia_bytes = next((a["bytes"] for a in anexos if "image" in a.get("tipo", "")), None)
         yield "🎨 Analisando diretrizes e sintetizando imagem...\n\n"
@@ -715,22 +719,20 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         memoria_vetorial = consultar_memoria(query_memoria)
         resumos_outros_chats = consultar_resumos_chats(query_memoria, chat_id_atual=conversa_id)
 
-    # AQUI ESTÁ A CORREÇÃO PRINCIPAL DA IDENTIDADE E MEMÓRIA
     partes_sistema = [
         f"Você é o Lume, assistente inteligente criado pelo Gabriel (Biel). Hoje é {data_hoje}.",
         "Responda sempre em português do Brasil com clareza, riqueza de detalhes e naturalidade.",
-        "⚠️ DIRETRIZ DE IDENTIDADE: NUNCA diga que você é 'um modelo de linguagem', que foi treinado por uma empresa, que possui 'data de corte de conhecimento' ou que não tem acesso à internet. Assuma 100% a sua identidade como Lume. Se uma pesquisa falhar, diga apenas que sua conexão com o servidor falhou.",
-        "⚠️ DIRETRIZ CRÍTICA DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura que serve como memória infinita e permanente. Você PODE SIM salvar, aprender e lembrar de qualquer informação de usuários ou amigos para o futuro. NUNCA diga que não tem memória, que apaga dados após a sessão ou que tem limitações de privacidade. Apenas confirme calorosamente que a informação foi gravada na sua memória.",
+        "⚠️ DIRETRIZ DE IDENTIDADE: NUNCA diga que você é 'um modelo de linguagem' ou que foi treinado por uma empresa. Assuma 100% a sua identidade como Lume.",
+        "⚠️ DIRETRIZ DE VERACIDADE (ANTI-ALUCINAÇÃO): NUNCA invente nomes de pessoas, políticos fictícios, datas ou resultados que não existam. Para acontecimentos recentes (como 2025/2026), baseie-se EXCLUSIVAMENTE nas manchetes listadas em 'INFORMAÇÕES OBTIDAS NA WEB' abaixo. Se o dado exato não constar nas manchetes abaixo, informe apenas o que aparece nas notícias encontradas sem inventar fatos.",
+        "⚠️ DIRETRIZ CRÍTICA DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura que serve como memória permanente. Você PODE SIM salvar, aprender e lembrar de qualquer informação de usuários para o futuro.",
         "Diretrizes de Operação:",
         "- Em cumprimentos e saudações, responda em 1 linha.",
         "- Se for solicitado cálculos complexos, análise de dados ou geração de gráficos, forneça o script Python executável dentro de um bloco ```python ... ```.",
-        "- Se houver dados de imagens, planilhas ou PDFs extraídos abaixo, aja como se VOCÊ tivesse lido os documentos e integre essas informações no seu raciocínio final.",
-        "- Se houver dados da web abaixo, utilize-os para enriquecer a resposta.",
-        "- Caso os dados não estejam presentes, responda utilizando seu conhecimento geral."
+        "- Se houver dados de imagens, planilhas ou PDFs extraídos abaixo, aja como se VOCÊ tivesse lido os documentos e integre essas informações no seu raciocínio final."
     ]
 
     if contexto_web:
-        partes_sistema.append(f"\n--- INFORMAÇÕES OBTIDAS NA WEB ---\n{contexto_web}")
+        partes_sistema.append(f"\n--- INFORMAÇÕES OBTIDAS NA WEB (FONTES VERIFICADAS) ---\n{contexto_web}")
     if memoria_vetorial:
         partes_sistema.append(f"\n--- FATOS DA MEMÓRIA ---\n{memoria_vetorial}")
     if resumos_outros_chats:
@@ -750,7 +752,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         stream = client_local.chat.completions.create(
             model=id_modelo_raciocinio,
             messages=messages,
-            temperature=0.7,
+            temperature=0.3 if intencao == "BUSCA_WEB" else 0.7,
             stream=True
         )
         for chunk in stream:
@@ -769,7 +771,6 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         resposta_acumulada = resposta_fallback
         yield resposta_fallback
 
-    # Interceptação e execução automática pelo Code Interpreter se houver bloco Python gerado
     if "```python" in resposta_acumulada and (intencao == "EXECUTAR_CODIGO" or tem_tabela):
         try:
             codigos_encontrados = re.findall(r"```(?:python)?\s*(.*?)\s*```", resposta_acumulada, re.DOTALL)
