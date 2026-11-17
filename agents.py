@@ -226,7 +226,7 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         }
 
 # =============================================================
-# 3. 🌐 MOTOR DE BUSCA WEB PROFUNDA (WIKIPÉDIA FULL + NEWS + DDG)
+# 3. 🌐 MOTOR DE BUSCA WEB PROFUNDA (FILTRADA POR ANO)
 # =============================================================
 
 def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, bool]:
@@ -279,43 +279,19 @@ def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
     query_limpa, eh_noticia = otimizar_query_busca(query, contexto_recente)
     query_segura = mascarar_dados_sensiveis(query_limpa)
     blocos_coletados = []
+    ano_atual_str = str(datetime.now().year)
+    busca_pede_ano_atual = ano_atual_str in query_segura
 
-    # 1. Wikipédia API com Extrato Completo (Imune a bloqueio de IP e contém candidatos e percentagens exatas)
-    try:
-        wiki_search_url = (
-            f"https://pt.wikipedia.org/w/api.php?action=query&list=search"
-            f"&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
-        )
-        r_ws = requests.get(wiki_search_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
-        if r_ws.status_code == 200:
-            resultados_wiki = r_ws.json().get("query", {}).get("search", [])
-            for w in resultados_wiki[:2]:
-                titulo_pag = w.get("title", "")
-                if titulo_pag:
-                    ext_url = (
-                        f"https://pt.wikipedia.org/w/api.php?action=query&prop=extracts"
-                        f"&exintro=1&explaintext=1&redirects=1&titles={urllib.parse.quote(titulo_pag)}&format=json"
-                    )
-                    r_ext = requests.get(ext_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
-                    if r_ext.status_code == 200:
-                        pages = r_ext.json().get("query", {}).get("pages", {})
-                        for _, p_data in pages.items():
-                            extrato = p_data.get("extract", "").strip()
-                            if extrato:
-                                blocos_coletados.append(f"📚 **Wikipédia ({titulo_pag})**\n{extrato[:1200]}")
-    except Exception:
-        pass
-
-    # 2. DuckDuckGo News & Text (Coleta trechos jornalísticos detalhados)
+    # 1. DuckDuckGo News & Text (Prioridade para fatos atuais e percentagens do TSE)
     try:
         with DDGS(timeout=8) as ddgs:
             if eh_noticia:
-                for r in ddgs.news(query_segura, safesearch="moderate", max_results=4):
+                for r in ddgs.news(query_segura, safesearch="moderate", max_results=5):
                     t = r.get('title', '')
                     b = r.get('body', '')
                     if b:
                         blocos_coletados.append(f"📰 **{t}**\n{b}")
-            for r in ddgs.text(query_segura, safesearch="moderate", max_results=4):
+            for r in ddgs.text(query_segura, safesearch="moderate", max_results=5):
                 t = r.get('title', '')
                 b = r.get('body', '')
                 if b and len(b) > 25:
@@ -323,7 +299,7 @@ def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
     except Exception:
         pass
 
-    # 3. Google News RSS (Sem repetir o título no resumo)
+    # 2. Google News RSS
     try:
         rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query_segura)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
         r_rss = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
@@ -338,8 +314,37 @@ def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
     except Exception:
         pass
 
+    # 3. Wikipédia API (Com filtro para ignorar anos passados como 2014/2022 quando a busca é sobre 2026)
+    try:
+        wiki_search_url = (
+            f"https://pt.wikipedia.org/w/api.php?action=query&list=search"
+            f"&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
+        )
+        r_ws = requests.get(wiki_search_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
+        if r_ws.status_code == 200:
+            resultados_wiki = r_ws.json().get("query", {}).get("search", [])
+            for w in resultados_wiki[:2]:
+                titulo_pag = w.get("title", "")
+                # Ignora artigos de eleições antigas se o usuário estiver perguntando sobre o ano atual
+                if busca_pede_ano_atual and any(ano_ant in titulo_pag for ano_ant in ["2010", "2014", "2018", "2022"]):
+                    continue
+                if titulo_pag:
+                    ext_url = (
+                        f"https://pt.wikipedia.org/w/api.php?action=query&prop=extracts"
+                        f"&exintro=1&explaintext=1&redirects=1&titles={urllib.parse.quote(titulo_pag)}&format=json"
+                    )
+                    r_ext = requests.get(ext_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
+                    if r_ext.status_code == 200:
+                        pages = r_ext.json().get("query", {}).get("pages", {})
+                        for _, p_data in pages.items():
+                            extrato = p_data.get("extract", "").strip()
+                            if extrato:
+                                blocos_coletados.append(f"📚 **Wikipédia ({titulo_pag})**\n{extrato[:900]}")
+    except Exception:
+        pass
+
     if blocos_coletados:
-        return "\n\n".join(blocos_coletados[:10])
+        return "\n\n".join(blocos_coletados[:8])
 
     return "⚠️ Nenhuma fonte verificada retornou números exatos para esta consulta no momento."
 
@@ -484,11 +489,11 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
     return f"🎨 Imagem sintetizada com base na sua diretriz visual!{feedback_txt}\n\n[IMAGEM_GERADA:{caminho_salvo}]"
 
 # =============================================================
-# 5. 🧠 ROTEADOR DE INTENÇÕES COM MEMÓRIA DE CONVERSA
+# 5. 🧠 ROTEADOR DE INTENÇÕES COM PRIORIDADE ESTRITA
 # =============================================================
 
 def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bool, historico_txt: str = "") -> dict:
-    """Usa o LLM e o contexto recente da conversa para decidir a ferramenta correta."""
+    """Garante que comandos de memória, código e imagem nunca sejam sobrescritos pelo histórico de busca."""
     
     if tem_anexos and not prompt.strip():
         return {"intencao": "DIRETO", "parametros": {}}
@@ -496,6 +501,42 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
     p = prompt.lower().strip()
     hist_lower = historico_txt.lower()
 
+    # PRIORIDADE 1: SALVAR NA MEMÓRIA VETORIAL (CHROMADB)
+    gatilhos_salvar = [
+        "registre", "registrar", "banco vetorial", "chromadb", "armazene", "armazenar",
+        "guarde", "guardar", "lembre", "lembrar", "salve", "salvar", "memorize", 
+        "memorizar", "anote", "anotar", "grave", "gravar na memória", "sua memória"
+    ]
+    if any(g in p for g in gatilhos_salvar):
+        return {"intencao": "SALVAR_MEMORIA", "parametros": {}}
+
+    # PRIORIDADE 2: CONSULTAR MEMÓRIA PESSOAL
+    gatilhos_memoria = [
+        "sobre o biel", "sobre o gabriel", "sobre seu criador", "quem sou eu", 
+        "meu nome", "minhas preferências", "quem te criou", "o que você sabe sobre mim",
+        "o que está salvo", "quais memórias"
+    ]
+    if any(m in p for m in gatilhos_memoria):
+        return {"intencao": "MEMORIA_PESSOAL", "parametros": {}}
+
+    # PRIORIDADE 3: GERAR IMAGEM
+    gatilhos_imagem = [
+        "gere uma imagem", "gerar imagem", "crie uma imagem", "criar imagem", 
+        "faça uma imagem", "desenhe", "ilustre", "ilustrar", "visualizar como", 
+        "renderize uma imagem", "foto realista", "arte digital", "usando essa como base"
+    ]
+    if any(g in p for g in gatilhos_imagem):
+        return {"intencao": "GERAR_IMAGEM", "parametros": {}}
+
+    # PRIORIDADE 4: EXECUTAR CÓDIGO / GRÁFICOS
+    gatilhos_codigo = [
+        "python", "código", "codigo", "script", "plot", "plote", "gráfico", 
+        "grafico", "matplotlib", "seaborn", "calcule", "simule", "dataframe"
+    ]
+    if any(c in p for c in gatilhos_codigo):
+        return {"intencao": "EXECUTAR_CODIGO", "parametros": {}}
+
+    # PRIORIDADE 5: BUSCA WEB DIRETA E PERGUNTAS DE CONTINUAÇÃO FACTUAL
     gatilhos_forcar_web = [
         "eleições", "eleicao", "eleito", "presidente", "quem ganhou", "quem venceu",
         "segundo turno", "primeiro turno", "acirrada", "disputa", "disputou", "adversário",
@@ -511,65 +552,12 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
     if any(t in hist_lower for t in temas_atuais_historico) and len(p.split()) <= 18:
         return {"intencao": "BUSCA_WEB", "parametros": {"query": prompt}}
 
-    prompt_roteador = f"""Você é o roteador central do Lume. Analise a mensagem do usuário e decida qual ferramenta utilizar.
-Responda APENAS com um JSON puro, sem formatação markdown e sem texto adicional.
+    # PRIORIDADE 6: SAUDAÇÃO RÁPIDA
+    cumprimentos = ["oi", "ola", "olá", "boa noite", "bom dia", "boa tarde", "e ai", "e aí"]
+    if p in cumprimentos or (len(p.split()) <= 2 and any(c in p for c in cumprimentos)):
+        return {"intencao": "SAUDACAO", "parametros": {}}
 
-Regras de Classificação:
-1. "EXECUTAR_CODIGO": Use SEMPRE que envolver scripts, programação, Python, matemática exata, simulação, manipulação de dados/planilhas ou plotar/gerar gráficos via matplotlib/código.
-2. "GERAR_IMAGEM": Use APENAS quando o usuário pedir arte visual, fotos, pinturas, ilustrações conceituais ou renderizações de difusão (sem código).
-3. "BUSCA_WEB": Se o usuário perguntar sobre acontecimentos recentes, política, eleições, candidatos, esportes, notícias, tempo/clima, cotações ou pesquisas na internet.
-4. "MEMORIA_PESSOAL": Se o usuário perguntar sobre o Gabriel (Biel), histórico pessoal ou perfil do criador.
-5. "SALVAR_MEMORIA": Se o usuário pedir para lembrar, guardar, salvar ou anotar um fato permanentemente.
-6. "SAUDACAO": Cumprimentos rápidos (oi, olá, bom dia).
-7. "DIRETO": Dúvidas conceituais teóricas ou conversas livres.
-
-Mensagem do usuário: "{prompt}"
-
-Formato esperado:
-{{"intencao": "NOME_DA_FERRAMENTA", "parametros": {{"query": "texto ou vazio"}}}}
-"""
-    try:
-        res = client_local.chat.completions.create(
-            model=id_modelo,
-            messages=[{"role": "user", "content": prompt_roteador}],
-            temperature=0.0,
-            max_tokens=50,
-            timeout=15.0
-        )
-        resposta_json = res.choices[0].message.content.strip()
-        resposta_json = resposta_json.replace("```json", "").replace("```", "").strip()
-        dados = json.loads(resposta_json)
-        
-        intencao = dados.get("intencao", "DIRETO")
-        return {"intencao": intencao, "parametros": dados.get("parametros", {})}
-    except Exception as e:
-        print(f"⚠️ Fallback do roteador ativado: {e}")
-        
-        gatilhos_codigo = ["python", "código", "codigo", "script", "plot", "plote", "gráfico", "grafico", "matplotlib", "seaborn", "calcule", "simule", "dataframe", "csv", "excel", "planilha"]
-        if any(c in p for c in gatilhos_codigo): 
-            return {"intencao": "EXECUTAR_CODIGO", "parametros": {}}
-        
-        gatilhos_imagem = [
-            "gere uma imagem", "gerar imagem", "crie uma imagem", "criar imagem", 
-            "faça uma imagem", "desenhe", "ilustre", "ilustrar", "visualizar como", 
-            "renderize uma imagem", "foto realista", "arte digital", "usando essa como base"
-        ]
-        if any(g in p for g in gatilhos_imagem): 
-            return {"intencao": "GERAR_IMAGEM", "parametros": {}}
-
-        gatilhos_salvar = ["armazene", "guarde", "lembre", "salve", "memorize", "anote", "gravar na memória"]
-        if any(g in p for g in gatilhos_salvar): 
-            return {"intencao": "SALVAR_MEMORIA", "parametros": {}}
-        
-        gatilhos_memoria = ["sobre o biel", "sobre o gabriel", "sobre seu criador", "quem sou eu", "meu nome", "minhas preferências", "quem te criou"]
-        if any(m in p for m in gatilhos_memoria): 
-            return {"intencao": "MEMORIA_PESSOAL", "parametros": {}}
-        
-        cumprimentos = ["oi", "ola", "olá", "boa noite", "bom dia", "boa tarde", "e ai", "e aí"]
-        if p in cumprimentos or (len(p.split()) <= 2 and any(c in p for c in cumprimentos)): 
-            return {"intencao": "SAUDACAO", "parametros": {}}
-        
-        return {"intencao": "DIRETO", "parametros": {}}
+    return {"intencao": "DIRETO", "parametros": {}}
 
 # =============================================================
 # 6. ⚙️ SELEÇÃO DINÂMICA DE MODELOS (API GEMINI + FALLBACK)
@@ -606,11 +594,33 @@ def gerar_micro_resumo(contexto_historico: str, id_modelo: str) -> str:
 
 CACHE_RESPOSTAS_TEMP = {}
 
-def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list) -> str:
-    """Tenta múltiplos modelos gratuitos antes de recorrer à exibição direta dos dados."""
+def extrair_fato_para_salvar(prompt: str, mensagens_anteriores: list) -> str:
+    """Identifica se o usuário quer salvar a informação da resposta anterior ou um fato escrito no próprio prompt."""
+    p_lower = prompt.lower()
+    termos_referencia = [
+        "essa informação", "esta informação", "essa informacao", "esta informacao",
+        "isso", "isto", "essa resposta", "esta resposta", "esse resultado", 
+        "esse fato", "o que você disse", "acima", "anterior"
+    ]
+    respostas_assistente = [t for a, t, _ in mensagens_anteriores if a == "assistant" and t.strip()]
+    
+    # Se o usuário fez referência à resposta anterior (ex: "Registre essa informação em seu banco vetorial")
+    if respostas_assistente and (any(tr in p_lower for tr in termos_referencia) or len(prompt.split()) <= 10):
+        ultima_resp = respostas_assistente[-1].strip()
+        # Limpa cabeçalhos de fallback se houver e guarda o núcleo informativo
+        ultima_resp_limpa = re.sub(r"^Com base nas fontes verificadas.*?:\s*", "", ultima_resp, flags=re.IGNORECASE).strip()
+        return f"Fato registrado da conversa: {ultima_resp_limpa[:500]}"
+    
+    return f"Fato explícito salvo a pedido do usuário: {prompt}"
+
+def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list, fato_gravado: str = "") -> str:
+    """Tenta múltiplos modelos gratuitos antes de recorrer à síntese local."""
+    if intencao == "SALVAR_MEMORIA" and fato_gravado:
+        return f"✅ **Informação registrada com sucesso no meu banco vetorial (ChromaDB)!**\n\n> *{fato_gravado}*\n\nVocê já pode consultar ou editar esse registro abrindo a aba **⚙️ Gerenciar Banco Vetorial** na barra lateral esquerda."
+
     for modelo_alt in ["openai", "mistral", "openai-fast"]:
         try:
-            time.sleep(0.8)
+            time.sleep(0.5)
             res_backup = requests.post(
                 "https://text.pollinations.ai/openai",
                 json={"model": modelo_alt, "messages": messages, "temperature": 0.2},
@@ -630,8 +640,6 @@ def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, m
 
     if intencao == "SAUDACAO":
         return "Olá! Tudo ótimo por aqui. Como posso ajudar você hoje?"
-    if intencao == "SALVAR_MEMORIA":
-        return "Informação registrada com sucesso na minha memória permanente (ChromaDB)! Vou me lembrar disso."
     if contexto_anexos:
         return f"Analisei os documentos anexados. Aqui estão as informações extraídas:\n\n{contexto_anexos}"
     if contexto_web and "⚠️" not in contexto_web:
@@ -713,8 +721,10 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     # ---------------------------------------------------------
     data_hoje = datetime.now().strftime("%d/%m/%Y")
 
+    fato_gravado = ""
     if intencao == "SALVAR_MEMORIA":
-        salvar_memoria(f"Fato explícito salvo a pedido do Gabriel: {prompt}", usuario="padrao")
+        fato_gravado = extrair_fato_para_salvar(prompt, mensagens_anteriores)
+        salvar_memoria(fato_gravado, usuario="padrao")
 
     contexto_web = ""
     if intencao == "BUSCA_WEB" and not anexos:
@@ -733,9 +743,11 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         "Responda sempre em português do Brasil com clareza, precisão factual e naturalidade.",
         "⚠️ DIRETRIZ DE IDENTIDADE: Assuma 100% a sua identidade como Lume.",
         "⚠️ REGRA RÍGIDA ANTI-ALUCINAÇÃO: NUNCA misture nomes de políticos e NUNCA chute porcentagens eleitorais que não estejam explicitamente escritas nos resultados da busca web abaixo. Sintetize a resposta em parágrafos fluidos usando os dados de 'FONTES VERIFICADAS DA WEB'.",
-        "⚠️ DIRETRIZ DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura para guardar fatos que o usuário pedir explicitamente."
+        "⚠️ DIRETRIZ DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura. Quando uma informação for salva, confirme calorosamente ao usuário mostrando um resumo do que foi gravado no banco vetorial."
     ]
 
+    if fato_gravado:
+        partes_sistema.append(f"\n--- REGISTRO ACABOU DE SER SALVO NO CHROMADB COM SUCESSO ---\nConteúdo gravado: {fato_gravado}")
     if contexto_web:
         partes_sistema.append(f"\n--- FONTES VERIFICADAS DA WEB (USE APENAS ESTES FATOS) ---\n{contexto_web}")
     if memoria_vetorial:
@@ -750,7 +762,12 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     for a, t, _ in mensagens_anteriores[-4:]:
         messages.append({"role": "user" if a == "user" else "assistant", "content": t[:1200]})
 
-    if contexto_web:
+    if intencao == "SALVAR_MEMORIA":
+        messages.append({
+            "role": "user",
+            "content": f"{prompt}\n\n[Instrução Interna: Confirme ao usuário que a informação '{fato_gravado[:200]}' já foi gravada com sucesso no seu banco vetorial ChromaDB.]"
+        })
+    elif contexto_web:
         prompt_enriquecido = (
             f"Pergunta do usuário: {prompt}\n\n"
             f"[Instrução Interna: Responda de forma conversacional usando os dados das FONTES VERIFICADAS DA WEB acima.]"
@@ -778,7 +795,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     except Exception as e:
         print(f"⚠️ API principal oscilou ({e}). Acionando contingência multi-modelo...")
         resposta_fallback = gerar_resposta_contingencia(
-            prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages
+            prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages, fato_gravado=fato_gravado
         )
         resposta_acumulada = resposta_fallback
         yield resposta_fallback
