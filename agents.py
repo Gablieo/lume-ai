@@ -226,125 +226,114 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         }
 
 # =============================================================
-# 3. 🌐 MOTOR DE BUSCA WEB RESILIENTE (COM GOOGLE NEWS RSS)
+# 3. 🌐 MOTOR DE BUSCA WEB PROFUNDA (MULTI-FONTE + CONTEXTO)
 # =============================================================
 
-def otimizar_query_busca(prompt: str) -> tuple[str, bool]:
-    termo = prompt.lower()
+def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, bool]:
+    texto_base = f"{contexto_recente} {prompt}".strip().lower() if contexto_recente else prompt.lower()
     
     termos_noticia = [
         "noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", 
         "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", 
-        "eleicao", "presidente", "ganhou", "venceu", "resultado", "2026", "2025"
+        "eleicao", "presidente", "ganhou", "venceu", "resultado", "turno",
+        "votos", "bolsonaro", "flávio", "flavio", "lula", "2026", "2025"
     ]
-    eh_noticia = any(t in termo for t in termos_noticia)
+    eh_noticia = any(t in texto_base for t in termos_noticia)
     
-    comandos_remover = [
-        "procure na internet sobre o", "procure na internet sobre a", "procure na internet sobre os", "procure na internet sobre as", "procure na internet sobre",
-        "pesquise na internet sobre o", "pesquise na internet sobre a", "pesquise na internet sobre",
-        "busque na internet sobre o", "busque na internet sobre a", "busque na internet sobre",
-        "procure na web sobre", "pesquise na web sobre", "busque na web sobre",
-        "procure na internet", "procure na web", "pesquise na internet", "pesquise na web",
-        "busque na internet", "busque na web", "procure sobre", "pesquise sobre", "busque sobre",
-        "quero saber mais sobre ele", "quero saber mais sobre ela", "quero saber mais sobre",
-        "quero saber sobre", "quero saber", "me diga sobre", "me fale sobre", "fale sobre",
-        "você pode procurar", "voce pode procurar", "você pode pesquisar", "voce pode pesquisar",
-        "por favor", "gostaria de saber", "pesquisar", "procurar", "buscar", "lume", "online",
-        "ola", "olá", "oi", "bom dia", "boa tarde", "boa noite", "e ai", "e aí"
+    stopwords_busca = [
+        "procure na internet", "pesquise na internet", "busque na internet",
+        "procure na web", "pesquise na web", "busque na web",
+        "consegue me dizer", "você sabe", "voce sabe", "me diga", "me fale",
+        "gostaria de saber", "por favor", "lume", "olá", "ola", "oi",
+        "bom dia", "boa tarde", "boa noite", "quem", "qual", "quais",
+        "como", "onde", "quando", "por que", "porque", "ficou", "foi",
+        "bem", "muito", "sobre", "para", "com", "que", "uma", "uns",
+        "mas", "ele", "ela", "não", "nao", "sim", "então", "entao"
     ]
     
-    for cmd in comandos_remover:
-        termo = re.sub(rf'\b{re.escape(cmd)}\b', ' ', termo)
+    termo = texto_base
+    for sw in stopwords_busca:
+        termo = re.sub(rf'\b{re.escape(sw)}\b', ' ', termo)
     
     termo = re.sub(r'[^\w\s]', ' ', termo)
-    termo = " ".join(termo.split())
+    palavras = []
+    for p in termo.split():
+        if len(p) > 2 or p.isdigit():
+            if p not in palavras:
+                palavras.append(p)
     
+    termo_limpo = " ".join(palavras[:8])
     ano_atual = datetime.now().year
     
     if eh_noticia:
-        if not termo or any(t in termo for t in ["ultimas", "noticias"]):
+        if not termo_limpo:
             return f"principais noticias brasil {ano_atual}", True
-        if str(ano_atual) not in termo:
-            return f"{termo} brasil {ano_atual}", True
-        return f"{termo} brasil", True
+        if str(ano_atual) not in termo_limpo and "2025" not in termo_limpo:
+            return f"{termo_limpo} {ano_atual}", True
+        return termo_limpo, True
         
-    return (termo if termo else prompt), False
+    return (termo_limpo if termo_limpo else prompt), False
 
-def pesquisar_web_direta(query: str) -> str:
-    query_limpa, eh_noticia = otimizar_query_busca(query)
+def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
+    query_limpa, eh_noticia = otimizar_query_busca(query, contexto_recente)
     query_segura = mascarar_dados_sensiveis(query_limpa)
+    blocos_coletados = []
 
-    # 1. Google News RSS (Imune a bloqueio de IP em nuvem no Streamlit Cloud)
+    # 1. Google News RSS (Com extração de título + descrição limpa)
     try:
         rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query_segura)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
         r_rss = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         if r_rss.status_code == 200:
             root = ET.fromstring(r_rss.content)
-            noticias_rss = []
             for item in root.findall(".//item")[:6]:
                 titulo = item.findtext("title") or ""
+                desc_html = item.findtext("description") or ""
+                desc_limpa = re.sub(r'<.*?>', ' ', desc_html)
+                desc_limpa = " ".join(desc_limpa.split())
                 pub_date = item.findtext("pubDate") or ""
-                fonte = item.findtext("source") or "Notícia"
                 if titulo:
                     data_curta = f" ({pub_date[:16]})" if pub_date else ""
-                    noticias_rss.append(f"📰 **{titulo}** — *{fonte}*{data_curta}")
-            if noticias_rss:
-                return "\n\n".join(noticias_rss)
+                    detalhe = f"\nResumo: {desc_limpa}" if desc_limpa and desc_limpa not in titulo else ""
+                    blocos_coletados.append(f"📰 **{titulo}**{data_curta}{detalhe}")
     except Exception:
         pass
 
-    # 2. DuckDuckGo News
-    if eh_noticia:
-        try:
-            resultados_news = []
-            with DDGS(timeout=8) as ddgs:
-                busca_news = ddgs.news(query_segura, safesearch="moderate", max_results=5)
-                for r in busca_news:
-                    titulo = r.get('title', 'Sem título')
-                    conteudo = r.get('body', '')
-                    data_pub = r.get('date', '')
-                    if conteudo:
-                        tag_data = f" ({data_pub[:10]})" if data_pub else ""
-                        resultados_news.append(f"📰 **{titulo}**{tag_data}\n{conteudo}")
-            if resultados_news:
-                return "\n\n".join(resultados_news)
-        except Exception:
-            pass
-
-    # 3. DuckDuckGo Text
+    # 2. DuckDuckGo News & Text (Complementa com trechos de matérias e números/porcentagens)
     try:
-        resultados_txt = []
         with DDGS(timeout=8) as ddgs:
-            busca_txt = ddgs.text(query_segura, safesearch="moderate", max_results=6)
-            for r in busca_txt:
-                titulo = r.get('title', 'Sem título')
-                conteudo = r.get('body', '')
-                if conteudo and len(conteudo) > 20:
-                    resultados_txt.append(f"📌 **{titulo}**\n{conteudo}")
-        if resultados_txt:
-            return "\n\n".join(resultados_txt)
+            if eh_noticia:
+                for r in ddgs.news(query_segura, safesearch="moderate", max_results=5):
+                    t = r.get('title', '')
+                    b = r.get('body', '')
+                    if b:
+                        blocos_coletados.append(f"📰 **{t}**\n{b}")
+            for r in ddgs.text(query_segura, safesearch="moderate", max_results=5):
+                t = r.get('title', '')
+                b = r.get('body', '')
+                if b and len(b) > 25:
+                    blocos_coletados.append(f"📌 **{t}**\n{b}")
     except Exception:
         pass
 
-    # 4. Wikipédia API em Português
-    try:
-        wiki_url = f"https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
-        r_wiki = requests.get(wiki_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
-        if r_wiki.status_code == 200:
-            wiki_data = r_wiki.json().get("query", {}).get("search", [])
-            if wiki_data:
-                wiki_res = []
+    # 3. Wikipédia em Português (Para dados enciclopédicos/históricos)
+    if len(blocos_coletados) < 3:
+        try:
+            wiki_url = f"https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query_segura)}&format=json&utf8="
+            r_wiki = requests.get(wiki_url, headers={"User-Agent": "LumeAI/2.0"}, timeout=6)
+            if r_wiki.status_code == 200:
+                wiki_data = r_wiki.json().get("query", {}).get("search", [])
                 for w in wiki_data[:3]:
                     t_w = w.get("title", "")
                     s_w = re.sub(r'<.*?>', '', w.get("snippet", ""))
                     if s_w:
-                        wiki_res.append(f"📚 **Wikipédia ({t_w})**\n{s_w}...")
-                if wiki_res:
-                    return "\n\n".join(wiki_res)
-    except Exception:
-        pass
+                        blocos_coletados.append(f"📚 **Wikipédia ({t_w})**\n{s_w}...")
+        except Exception:
+            pass
 
-    return "⚠️ A busca na internet não retornou registros verificados para esta consulta específica no momento."
+    if blocos_coletados:
+        return "\n\n".join(blocos_coletados[:10])
+
+    return "⚠️ Nenhuma fonte verificada retornou números exatos para esta consulta no momento."
 
 # =============================================================
 # 4. 🎨 MOTOR DE GERAÇÃO E AUTOAVALIAÇÃO VISUAL (DIFFUSION + VLM)
@@ -487,24 +476,32 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
     return f"🎨 Imagem sintetizada com base na sua diretriz visual!{feedback_txt}\n\n[IMAGEM_GERADA:{caminho_salvo}]"
 
 # =============================================================
-# 5. 🧠 ROTEADOR DE INTENÇÕES INTELIGENTE (FUNCTION CALLING)
+# 5. 🧠 ROTEADOR DE INTENÇÕES COM MEMÓRIA DE CONVERSA
 # =============================================================
 
-def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bool) -> dict:
-    """Usa o LLM como um roteador de ferramentas com prioridade estrita e checagem factual."""
+def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bool, historico_txt: str = "") -> dict:
+    """Usa o LLM e o contexto recente da conversa para decidir a ferramenta correta."""
     
     if tem_anexos and not prompt.strip():
         return {"intencao": "DIRETO", "parametros": {}}
 
     p = prompt.lower().strip()
+    hist_lower = historico_txt.lower()
 
-    # Prioridade 1: Gatilhos diretos de eventos recentes/fatos da web (evita que o LLM pule a busca)
+    # Gatilhos de eventos recentes, política, eleições e perguntas de continuação sobre fatos
     gatilhos_forcar_web = [
         "eleições", "eleicao", "eleito", "presidente", "quem ganhou", "quem venceu",
+        "segundo turno", "primeiro turno", "acirrada", "quantos %", "porcentagem",
+        "votos", "bolsonaro", "flávio", "flavio", "lula", "boulos", "tarcísio", "tarcisio",
         "2025", "2026", "notícias", "noticia", "ultimas", "últimas", "clima", "previsão",
         "tempo hoje", "cotação", "dólar", "bitcoin", "pesquise", "busque", "procure na web", "na internet"
     ]
     if any(g in p for g in gatilhos_forcar_web):
+        return {"intencao": "BUSCA_WEB", "parametros": {"query": prompt}}
+
+    # Se a conversa imediatamente anterior já era sobre eleições/2026/notícias, mantém na BUSCA_WEB
+    temas_atuais_historico = ["eleições", "eleição", "presidente", "2026", "segundo turno", "notícias"]
+    if any(t in hist_lower for t in temas_atuais_historico) and len(p.split()) <= 18:
         return {"intencao": "BUSCA_WEB", "parametros": {"query": prompt}}
 
     prompt_roteador = f"""Você é o roteador central do Lume. Analise a mensagem do usuário e decida qual ferramenta utilizar.
@@ -513,7 +510,7 @@ Responda APENAS com um JSON puro, sem formatação markdown e sem texto adiciona
 Regras de Classificação:
 1. "EXECUTAR_CODIGO": Use SEMPRE que envolver scripts, programação, Python, matemática exata, simulação, manipulação de dados/planilhas ou plotar/gerar gráficos via matplotlib/código.
 2. "GERAR_IMAGEM": Use APENAS quando o usuário pedir arte visual, fotos, pinturas, ilustrações conceituais ou renderizações de difusão (sem código).
-3. "BUSCA_WEB": Se o usuário perguntar sobre acontecimentos recentes, política, esportes, notícias, tempo/clima, cotações ou pesquisas na internet.
+3. "BUSCA_WEB": Se o usuário perguntar sobre acontecimentos recentes, política, eleições, candidatos, esportes, notícias, tempo/clima, cotações ou pesquisas na internet.
 4. "MEMORIA_PESSOAL": Se o usuário perguntar sobre o Gabriel (Biel), histórico pessoal ou perfil do criador.
 5. "SALVAR_MEMORIA": Se o usuário pedir para lembrar, guardar, salvar ou anotar um fato permanentemente.
 6. "SAUDACAO": Cumprimentos rápidos (oi, olá, bom dia).
@@ -603,12 +600,12 @@ def gerar_micro_resumo(contexto_historico: str, id_modelo: str) -> str:
 CACHE_RESPOSTAS_TEMP = {}
 
 def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list) -> str:
-    """Aciona LLM secundário gratuito ou responde usando a memória local/temporária se a API principal falhar."""
+    """Aciona LLM secundário gratuito ou responde usando os dados reais coletados se a API principal falhar."""
     try:
         res_backup = requests.post(
             "https://text.pollinations.ai/openai",
-            json={"model": "openai", "messages": messages, "temperature": 0.3},
-            timeout=15
+            json={"model": "openai", "messages": messages, "temperature": 0.2},
+            timeout=20
         )
         if res_backup.status_code == 200:
             conteudo = res_backup.json().get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -627,17 +624,13 @@ def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, m
     if intencao == "SALVAR_MEMORIA":
         return "Informação registrada com sucesso na minha memória permanente (ChromaDB)! Vou me lembrar disso."
     if contexto_anexos:
-        return f"Analisei os documentos anexados localmente. Aqui estão as informações extraídas:\n\n{contexto_anexos}"
+        return f"Analisei os documentos anexados. Aqui estão as informações extraídas:\n\n{contexto_anexos}"
     if contexto_web and "⚠️" not in contexto_web:
-        return f"Aqui estão as informações mais recentes que encontrei na web:\n\n{contexto_web}"
+        return f"Aqui estão as notícias e dados verificados que encontrei na web sobre a sua pergunta:\n\n{contexto_web}"
     if memoria_vetorial:
-        return f"Consultando minha memória vetorial (ChromaDB), encontrei estes registros sobre o assunto:\n\n{memoria_vetorial}"
+        return f"Consultando minha memória pessoal (ChromaDB), encontrei estes registros:\n\n{memoria_vetorial}"
 
-    busca_emergencia = consultar_memoria(prompt)
-    if busca_emergencia:
-        return f"Com base nos registros salvos na minha memória:\n\n{busca_emergencia}"
-
-    return "No momento o servidor principal está com alta demanda, mas minha memória vetorial, busca web e leitor de documentos seguem ativos. Pode reformular ou enviar os dados que deseja analisar!"
+    return "O motor de linguagem está processando muitas requisições neste segundo. Aguarde alguns instantes e envie novamente, ou insira sua chave gratuita do Gemini em '🔑 Configurar API' na barra lateral para velocidade máxima!"
 
 def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexos: list = None):
     """Executa o pipeline multimodal em 2 passos com suporte a Sandbox Python, PDFs, Dados e Imagens."""
@@ -653,7 +646,12 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     id_modelo_raciocinio = obter_modelo_para_modo(modo, tem_imagem=False)
     id_modelo_visao = obter_modelo_para_modo(modo, tem_imagem=True)
 
-    decisao_llm = classificar_intencao_inteligente(prompt, id_modelo_raciocinio, tem_anexos=bool(anexos))
+    mensagens_anteriores = carregar_mensagens(conversa_id)[-6:]
+    ultimas_msgs_usuario = " ".join([t for a, t, _ in mensagens_anteriores[-4:] if a == "user"])
+
+    decisao_llm = classificar_intencao_inteligente(
+        prompt, id_modelo_raciocinio, tem_anexos=bool(anexos), historico_txt=ultimas_msgs_usuario
+    )
     intencao = decisao_llm["intencao"]
 
     if intencao == "GERAR_IMAGEM" and not tem_pdf:
@@ -704,13 +702,15 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     # ---------------------------------------------------------
     # PASSO 2: RACIOCÍNIO CENTRAL E EXECUÇÃO (MODELO PRINCIPAL)
     # ---------------------------------------------------------
-    mensagens_anteriores = carregar_mensagens(conversa_id)[-6:]
     data_hoje = datetime.now().strftime("%d/%m/%Y")
 
     if intencao == "SALVAR_MEMORIA":
         salvar_memoria(f"Fato explícito salvo a pedido do Gabriel: {prompt}", usuario="padrao")
 
-    contexto_web = pesquisar_web_direta(prompt) if intencao == "BUSCA_WEB" and not anexos else ""
+    contexto_web = ""
+    if intencao == "BUSCA_WEB" and not anexos:
+        contexto_web = pesquisar_web_direta(prompt, contexto_recente=ultimas_msgs_usuario)
+
     memoria_vetorial = ""
     resumos_outros_chats = ""
 
@@ -721,18 +721,14 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
 
     partes_sistema = [
         f"Você é o Lume, assistente inteligente criado pelo Gabriel (Biel). Hoje é {data_hoje}.",
-        "Responda sempre em português do Brasil com clareza, riqueza de detalhes e naturalidade.",
-        "⚠️ DIRETRIZ DE IDENTIDADE: NUNCA diga que você é 'um modelo de linguagem' ou que foi treinado por uma empresa. Assuma 100% a sua identidade como Lume.",
-        "⚠️ DIRETRIZ DE VERACIDADE (ANTI-ALUCINAÇÃO): NUNCA invente nomes de pessoas, políticos fictícios, datas ou resultados que não existam. Para acontecimentos recentes (como 2025/2026), baseie-se EXCLUSIVAMENTE nas manchetes listadas em 'INFORMAÇÕES OBTIDAS NA WEB' abaixo. Se o dado exato não constar nas manchetes abaixo, informe apenas o que aparece nas notícias encontradas sem inventar fatos.",
-        "⚠️ DIRETRIZ CRÍTICA DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura que serve como memória permanente. Você PODE SIM salvar, aprender e lembrar de qualquer informação de usuários para o futuro.",
-        "Diretrizes de Operação:",
-        "- Em cumprimentos e saudações, responda em 1 linha.",
-        "- Se for solicitado cálculos complexos, análise de dados ou geração de gráficos, forneça o script Python executável dentro de um bloco ```python ... ```.",
-        "- Se houver dados de imagens, planilhas ou PDFs extraídos abaixo, aja como se VOCÊ tivesse lido os documentos e integre essas informações no seu raciocínio final."
+        "Responda sempre em português do Brasil com clareza, precisão factual e naturalidade.",
+        "⚠️ DIRETRIZ DE IDENTIDADE: Assuma 100% a sua identidade como Lume.",
+        "⚠️ REGRA RÍGIDA ANTI-ALUCINAÇÃO: NUNCA misture nomes de políticos (como criar nomes inexistentes) e NUNCA chute porcentagens eleitorais que não estejam explicitamente escritas nos resultados da busca web abaixo. Se o usuário perguntar uma porcentagem exata e ela não estiver no bloco 'FONTES VERIFICADAS DA WEB', informe os dados reais disponíveis nas fontes e diga com transparência caso o percentual exato não conste no resumo da matéria.",
+        "⚠️ DIRETRIZ DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura para guardar fatos que o usuário pedir explicitamente."
     ]
 
     if contexto_web:
-        partes_sistema.append(f"\n--- INFORMAÇÕES OBTIDAS NA WEB (FONTES VERIFICADAS) ---\n{contexto_web}")
+        partes_sistema.append(f"\n--- FONTES VERIFICADAS DA WEB (USE APENAS ESTES FATOS) ---\n{contexto_web}")
     if memoria_vetorial:
         partes_sistema.append(f"\n--- FATOS DA MEMÓRIA ---\n{memoria_vetorial}")
     if resumos_outros_chats:
@@ -745,14 +741,22 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     for a, t, _ in mensagens_anteriores:
         messages.append({"role": "user" if a == "user" else "assistant", "content": t})
 
-    messages.append({"role": "user", "content": prompt if prompt.strip() else "Analise os anexos extraídos."})
+    if contexto_web:
+        prompt_enriquecido = (
+            f"Pergunta do usuário: {prompt}\n\n"
+            f"[Instrução Interna: Responda com base nas FONTES VERIFICADAS DA WEB acima. "
+            f"Não invente nomes compostos nem chute números que não estejam nos textos coletados.]"
+        )
+        messages.append({"role": "user", "content": prompt_enriquecido})
+    else:
+        messages.append({"role": "user", "content": prompt if prompt.strip() else "Analise os anexos extraídos."})
 
     resposta_acumulada = ""
     try:
         stream = client_local.chat.completions.create(
             model=id_modelo_raciocinio,
             messages=messages,
-            temperature=0.3 if intencao == "BUSCA_WEB" else 0.7,
+            temperature=0.2 if intencao == "BUSCA_WEB" else 0.7,
             stream=True
         )
         for chunk in stream:
@@ -764,7 +768,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
             
     except Exception as e:
-        print(f"⚠️ API principal oscilou ({e}). Acionando memória de contingência...")
+        print(f"⚠️ API principal oscilou ({e}). Acionando contingência...")
         resposta_fallback = gerar_resposta_contingencia(
             prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages
         )
@@ -789,11 +793,6 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
                     yield tag_img
         except Exception as e:
             print(f"⚠️ Falha no Code Interpreter pós-processamento: {e}")
-
-    if intencao == "BUSCA_WEB" and not anexos and resposta_acumulada and "⚠️" not in resposta_acumulada:
-        termos_efemeros = ["tempo", "previsão", "clima", "cotação", "hoje", "notícia", "notícias"]
-        if not any(t in prompt.lower() for t in termos_efemeros):
-            salvar_memoria(f"Conhecimento adquirido sobre '{prompt}': {resposta_acumulada[:300]}...", usuario="padrao")
 
     if resposta_acumulada and "⚠️" not in resposta_acumulada:
         resumo = gerar_micro_resumo(f"Usuário: {prompt}\nLume: {resposta_acumulada}", id_modelo_raciocinio)
