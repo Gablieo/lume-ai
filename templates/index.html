@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat IA Híbrido</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { background-color: #121214; color: #e1e1e6; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        .chat-container { width: 100%; max-width: 850px; height: 90vh; background: #202024; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .header { background: #121214; padding: 20px; border-bottom: 1px solid #29292e; text-align: center; font-weight: bold; font-size: 1.1rem; color: #00b37e; }
+        .messages-box { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+        .message { max-width: 80%; padding: 12px 16px; border-radius: 8px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+        .user-message { background: #00875f; color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
+        .bot-message { background: #29292e; color: #e1e1e6; align-self: flex-start; border-bottom-left-radius: 2px; }
+        .input-area { padding: 15px; background: #121214; border-top: 1px solid #29292e; display: flex; gap: 10px; }
+        input { flex: 1; padding: 12px; border-radius: 6px; border: 1px solid #29292e; background: #202024; color: #fff; outline: none; }
+        input:focus { border-color: #00b37e; }
+        button { padding: 12px 24px; background: #00b37e; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #00875f; }
+        .loading { font-style: italic; color: #8d8d99; }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="header">⚡ Chat IA Híbrido (LM Studio + Gemini)</div>
+        <div class="messages-box" id="chatBox">
+            <div class="message bot-message">Olá! Como posso ajudar você hoje?</div>
+        </div>
+        <div class="input-area">
+            <input type="text" id="userInput" placeholder="Digite sua mensagem..." onkeypress="handleKey(event)">
+            <button onclick="sendMessage()">Enviar</button>
+        </div>
+    </div>
+
+    <script>
+        async function sendMessage() {
+            const input = document.getElementById('userInput');
+            const chatBox = document.getElementById('chatBox');
+            const text = input.value.trim();
+            if (!text) return;
+
+            chatBox.innerHTML += `<div class="message user-message">${escapeHtml(text)}</div>`;
+            input.value = '';
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'message bot-message loading';
+            loadingDiv.innerText = 'Processando com as IAs...';
+            chatBox.appendChild(loadingDiv);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+                const data = await response.json();
+                loadingDiv.classList.remove('loading');
+                loadingDiv.innerText = data.response;
+            } catch (err) {
+                loadingDiv.innerText = 'Erro ao processar a resposta.';
+            }
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function handleKey(e) {
+            if (e.key === 'Enter') sendMessage();
+        }
+
+        function escapeHtml(text) {
+            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+    </script>
+</body>
+</html>
