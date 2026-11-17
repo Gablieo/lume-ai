@@ -88,8 +88,8 @@ def renderizar_conteudo_assistente(texto: str):
         
         if texto_antes:
             st.markdown(texto_antes)
-        if os.path.exists(caminho_img):
-            st.image(caminho_img, caption="Gráfico / Imagem gerada localmente", width=460)
+        if os.path.exists(caminho_img) or caminho_img.startswith("http"):
+            st.image(caminho_img, caption="Gráfico / Imagem gerada pelo Lume", width=460)
         if texto_depois:
             st.markdown(texto_depois)
     else:
@@ -229,8 +229,11 @@ st.markdown("""
 if "chat_atual_id" not in st.session_state:
     st.session_state.chat_atual_id = None
 
+if "GEMINI_API_KEY" not in st.session_state:
+    st.session_state["GEMINI_API_KEY"] = ""
+
 # =============================================================
-# BARRA LATERAL (SIDEBAR COM PASTAS)
+# BARRA LATERAL (SIDEBAR COM PASTAS E CONFIGURAÇÃO DE API)
 # =============================================================
 
 with st.sidebar:
@@ -248,6 +251,27 @@ with st.sidebar:
         index=2, 
         label_visibility="collapsed"
     )
+
+    with st.popover("🔑 Configurar API", use_container_width=True):
+        st.markdown("<h4 style='color: #E3E3E3;'>⚡ Chave da API (Sessão)</h4>", unsafe_allow_html=True)
+        nova_chave = st.text_input(
+            "GEMINI_API_KEY (Opcional):",
+            value=st.session_state.get("GEMINI_API_KEY", ""),
+            type="password",
+            placeholder="AIzaSy... (isolada no seu navegador)"
+        )
+        col_api1, col_api2 = st.columns([1, 1])
+        with col_api1:
+            if st.button("💾 Aplicar", use_container_width=True, key="btn_salvar_api"):
+                st.session_state["GEMINI_API_KEY"] = nova_chave.strip()
+                st.success("Chave aplicada!")
+                st.rerun()
+        with col_api2:
+            if st.button("🧹 Limpar", use_container_width=True, key="btn_limpar_api"):
+                st.session_state["GEMINI_API_KEY"] = ""
+                st.info("Usando modo padrão.")
+                st.rerun()
+        st.caption("🔒 Sua chave fica salva apenas na memória temporária da sua aba atual.")
 
     st.markdown("<hr style='border-color: #282830; margin: 15px 0;'>", unsafe_allow_html=True)
     st.markdown("<p style='color: #8E918F; font-size: 12px; padding-left: 8px;'>Memória Vetorial (ChromaDB)</p>", unsafe_allow_html=True)
@@ -398,6 +422,7 @@ with st.sidebar:
 # =============================================================
 
 HTML_HOLOGRAM_3D = """<!DOCTYPE html><html><head><style>body { margin: 0; background-color: #131316; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; font-family: sans-serif; } canvas { display: block; } .title { color: #E3E3E3; font-size: 18px; font-weight: 500; margin-top: 15px; } .sub { color: #8E918F; font-size: 13px; margin-top: 5px; }</style></head><body><canvas id="coreCanvas" width="500" height="380"></canvas><div class="title">Lume</div><div class="sub">O que temos para hoje?</div><script>const canvas=document.getElementById('coreCanvas'),ctx=canvas.getContext('2d'),width=500,height=380,cx=250,cy=190;let time=0;const coreNodes=[];for(let i=0;i<40;i++){let u=Math.random(),v=Math.random(),t=u*2*Math.PI,p=Math.acos(2*v-1),r=45;coreNodes.push([r*Math.sin(p)*Math.cos(t),r*Math.sin(p)*Math.sin(t),r*Math.cos(p)])}const ringConfigs=[{r:130,tx:0.4,ty:0.2,spd:0.02,col:"#444746",dash:!1,w:1},{r:140,tx:-0.5,ty:0.8,spd:-0.015,col:"#282830",dash:!0,w:1},{r:110,tx:1.2,ty:-0.5,spd:0.035,col:"#8E918F",dash:!1,w:1},{r:80,tx:0,ty:0,spd:0.05,col:"#FFFFFF",dash:!1,w:2}],rings=ringConfigs.map(c=>{let pts=[];for(let i=0;i<45;i++){let a=i/45*Math.PI*2;pts.push([c.r*Math.cos(a),c.r*Math.sin(a),0])}return{...c,pts,angle:0}});function rotate(x,y,z,ax,ay,az){let cosX=Math.cos(ax),sinX=Math.sin(ax),cosY=Math.cos(ay),sinY=Math.sin(ay),cosZ=Math.cos(az),sinZ=Math.sin(az);let y1=y*cosX-z*sinX,z1=y*sinX+z*cosX,x1=x;let x2=x1*cosY+z1*sinY,z2=-x1*sinY+z1*cosY,y2=y1;let x3=x2*cosZ-y2*sinZ,y3=x2*sinZ+y2*cosZ,z3=z2;return[x3,y3,z3]}function project(x,y,z){let f=300/(360+z);return[cx+x*f,cy+y*f,f]}function animate(){ctx.clearRect(0,0,width,height);time+=0.015;let gAx=time*0.4,gAy=time*0.7,q=[];rings.forEach(r=>{r.angle+=r.spd;let pPts=r.pts.map(p=>{let r1=rotate(p[0],p[1],p[2],0,0,r.angle),r2=rotate(r1[0],r1[1],r1[2],r.tx,r.ty,0),r3=rotate(r2[0],r2[1],r2[2],gAx,gAy,0),pr=project(r3[0],r3[1],r3[2]);return[...pr,r3[2]]});for(let i=0;i<pPts.length;i++){let p1=pPts[i],p2=pPts[(i+1)%pPts.length],zA=(p1[2]+p2[2])/2;if(!r.dash||i%2!==0)q.push({z:zA,type:'line',x1:p1[0],y1:p1[1],x2:p2[0],y2:p2[1],col:zA<-30?"#1c1c21":r.col,w:r.w})}});coreNodes.forEach(n=>{let r=rotate(n[0],n[1],n[2],gAx,gAy,time*1.5),pr=project(r[0],r[1],r[2]);q.push({z:r[2],type:'oval',x:pr[0],y:pr[1],r:Math.max(1,2.5*pr[2]),col:r[2]>0?"#FFFFFF":"#444746"})});q.sort((a,b)=>a.z-b.z);q.forEach(i=>{ctx.beginPath();if(i.type==='line'){ctx.moveTo(i.x1,i.y1);ctx.lineTo(i.x2,i.y2);ctx.strokeStyle=i.col;ctx.lineWidth=i.w;ctx.stroke()}else{ctx.arc(i.x,i.y,i.r,0,Math.PI*2);ctx.fillStyle=i.col;ctx.fill()}});requestAnimationFrame(animate)}animate();</script></body></html>"""
+
 # =============================================================
 # TELA PRINCIPAL DO CHAT
 # =============================================================
