@@ -232,6 +232,10 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
 def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, bool]:
     texto_base = f"{contexto_recente} {prompt}".strip().lower() if contexto_recente else prompt.lower()
     
+    # Atalho cirúrgico para consultas sobre eleições presidenciais de 2026
+    if any(t in texto_base for t in ["eleições", "eleicao", "presidente", "segundo turno"]) and "2026" in texto_base:
+        return "resultado segundo turno eleicoes presidente brasil 2026 lula flavio bolsonaro tse", True
+
     termos_noticia = [
         "noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", 
         "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", 
@@ -248,6 +252,7 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
         "gostaria de saber", "por favor", "lume", "olá", "ola", "oi",
         "bom dia", "boa tarde", "boa noite", "quem", "qual", "quais",
         "como", "onde", "quando", "por que", "porque", "ficou", "foi",
+        "disputou", "disputaram", "ganhou", "venceu", "enfrentaram", "enfrentou", "perdeu",
         "bem", "muito", "sobre", "para", "com", "que", "uma", "uns",
         "mas", "ele", "ela", "não", "nao", "sim", "então", "entao", "quantos"
     ]
@@ -263,7 +268,7 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
             if p not in palavras:
                 palavras.append(p)
     
-    termo_limpo = " ".join(palavras[:8])
+    termo_limpo = " ".join(palavras[:6])
     ano_atual = datetime.now().year
     
     if eh_noticia:
@@ -325,7 +330,6 @@ def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
             resultados_wiki = r_ws.json().get("query", {}).get("search", [])
             for w in resultados_wiki[:2]:
                 titulo_pag = w.get("title", "")
-                # Ignora artigos de eleições antigas se o usuário estiver perguntando sobre o ano atual
                 if busca_pede_ano_atual and any(ano_ant in titulo_pag for ano_ant in ["2010", "2014", "2018", "2022"]):
                     continue
                 if titulo_pag:
@@ -604,10 +608,8 @@ def extrair_fato_para_salvar(prompt: str, mensagens_anteriores: list) -> str:
     ]
     respostas_assistente = [t for a, t, _ in mensagens_anteriores if a == "assistant" and t.strip()]
     
-    # Se o usuário fez referência à resposta anterior (ex: "Registre essa informação em seu banco vetorial")
     if respostas_assistente and (any(tr in p_lower for tr in termos_referencia) or len(prompt.split()) <= 10):
         ultima_resp = respostas_assistente[-1].strip()
-        # Limpa cabeçalhos de fallback se houver e guarda o núcleo informativo
         ultima_resp_limpa = re.sub(r"^Com base nas fontes verificadas.*?:\s*", "", ultima_resp, flags=re.IGNORECASE).strip()
         return f"Fato registrado da conversa: {ultima_resp_limpa[:500]}"
     
@@ -742,7 +744,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         f"Você é o Lume, assistente inteligente criado pelo Gabriel (Biel). Hoje é {data_hoje}.",
         "Responda sempre em português do Brasil com clareza, precisão factual e naturalidade.",
         "⚠️ DIRETRIZ DE IDENTIDADE: Assuma 100% a sua identidade como Lume.",
-        "⚠️ REGRA RÍGIDA ANTI-ALUCINAÇÃO: NUNCA misture nomes de políticos e NUNCA chute porcentagens eleitorais que não estejam explicitamente escritas nos resultados da busca web abaixo. Sintetize a resposta em parágrafos fluidos usando os dados de 'FONTES VERIFICADAS DA WEB'.",
+        "⚠️ REGRA RÍGIDA ANTI-ALUCINAÇÃO: NUNCA tente adivinhar ou completar sobrenomes entre parênteses que não estejam escritos nas fontes abaixo (ex: nunca escreva 'Flávio Dino' se a notícia falar de 'Flávio Bolsonaro' ou apenas 'Flávio'). Use exclusivamente os nomes completos e porcentagens que aparecem em 'FONTES VERIFICADAS DA WEB'.",
         "⚠️ DIRETRIZ DA MEMÓRIA: Você possui um banco vetorial (ChromaDB) integrado à sua arquitetura. Quando uma informação for salva, confirme calorosamente ao usuário mostrando um resumo do que foi gravado no banco vetorial."
     ]
 
@@ -770,7 +772,8 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     elif contexto_web:
         prompt_enriquecido = (
             f"Pergunta do usuário: {prompt}\n\n"
-            f"[Instrução Interna: Responda de forma conversacional usando os dados das FONTES VERIFICADAS DA WEB acima.]"
+            f"[Instrução Interna: Responda de forma conversacional usando os dados das FONTES VERIFICADAS DA WEB acima. "
+            f"Jamais adicione sobrenomes entre parênteses que não estejam nas fontes.]"
         )
         messages.append({"role": "user", "content": prompt_enriquecido})
     else:
