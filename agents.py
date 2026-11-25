@@ -232,7 +232,18 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
 # =============================================================
 
 def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, bool]:
-    texto_base = f"{contexto_recente} {prompt}".strip().lower() if contexto_recente else prompt.lower()
+    prompt_lower = prompt.lower().strip()
+
+    # Só mistura o histórico anterior se a pergunta atual for uma continuação dependente de contexto
+    termos_continuacao = ["ele", "ela", "dele", "dela", "disso", "acirrada", "quantos %", "porcentagem", "segundo turno", "disputou"]
+    precisa_contexto = (
+        bool(contexto_recente)
+        and len(prompt_lower.split()) <= 10
+        and any(tc in prompt_lower for tc in termos_continuacao)
+    )
+
+    # Coloca o prompt atual primeiro para nunca cortar o assunto principal
+    texto_base = f"{prompt_lower} {contexto_recente.lower()}" if precisa_contexto else prompt_lower
     
     # Atalho cirúrgico para consultas sobre eleições presidenciais de 2026
     if any(t in texto_base for t in ["eleições", "eleicao", "presidente", "segundo turno"]) and "2026" in texto_base:
@@ -252,8 +263,9 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
         "procure na web", "pesquise na web", "busque na web",
         "consegue me dizer", "você sabe", "voce sabe", "me diga", "me fale",
         "gostaria de saber", "por favor", "lume", "olá", "ola", "oi",
-        "bom dia", "boa tarde", "boa noite", "quem", "qual", "quais",
+        "bom dia", "boa tarde", "boa noite", "quem", "qual", "quais", "são", "sao",
         "como", "onde", "quando", "por que", "porque", "ficou", "foi",
+        "ultimas", "últimas", "noticias", "notícias", "noticia", "notícia",
         "disputou", "disputaram", "ganhou", "venceu", "enfrentaram", "enfrentou", "perdeu",
         "bem", "muito", "sobre", "para", "com", "que", "uma", "uns",
         "mas", "ele", "ela", "não", "nao", "sim", "então", "entao", "quantos"
