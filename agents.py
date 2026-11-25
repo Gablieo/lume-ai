@@ -120,6 +120,22 @@ def codificar_imagem_base64(imagem_bytes: bytes) -> str:
     """Converte bytes brutos da imagem em Base64 para envio multimodal."""
     return base64.b64encode(imagem_bytes).decode("utf-8")
 
+def eh_arquivo_imagem(anexo: dict) -> bool:
+    tipo = (anexo.get("tipo") or "").lower()
+    nome = (anexo.get("nome") or "").lower()
+    return "image" in tipo or nome.endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+def obter_mime_imagem(anexo: dict) -> str:
+    tipo = (anexo.get("tipo") or "").lower()
+    nome = (anexo.get("nome") or "").lower()
+    if tipo.startswith("image/"):
+        return tipo
+    if nome.endswith(".png"):
+        return "image/png"
+    if nome.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
 def extrair_texto_pdf(pdf_bytes: bytes) -> str:
     """Extrai texto bruto de um arquivo PDF carregado em memória."""
     try:
@@ -408,14 +424,13 @@ def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prom
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt_critico},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                 ]
             }],
-            max_tokens=80,
-            timeout=15.0
+            timeout=25.0
         )
 
-        critica = res.choices[0].message.content.strip()
+        critica = (res.choices[0].message.content or "").strip()
         
         if critica and "⚠️" not in critica:
             fato_aprendizado = f"Estilo e composição visual bem-sucedidos para '{prompt_usuario}': prompt usado ('{prompt_en}'). Análise: {critica}"
@@ -426,7 +441,7 @@ def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prom
         print(f"⚠️ Crítico visual indisponível ou timeout: {e}")
         return ""
 
-def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None, cliente=None) -> str:
+def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None, mime_referencia: str = "image/png", cliente=None) -> str:
     """Consulta memórias passadas, traduz o prompt (ou analisa imagem base), sintetiza a imagem e autoavalia."""
     cliente_uso = cliente or client_local
     os.makedirs("geracoes_lume", exist_ok=True)
@@ -453,7 +468,7 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
                         f"Return ONLY the English prompt text."
                     )
                 },
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_ref}"}}
+                {"type": "image_url", "image_url": {"url": f"data:{mime_referencia};base64,{b64_ref}"}}
             ]
         else:
             conteudo_msg = (
@@ -466,10 +481,9 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
         res = cliente_uso.chat.completions.create(
             model=id_modelo,
             messages=[{"role": "user", "content": conteudo_msg}],
-            max_tokens=60,
-            timeout=15.0
+            timeout=25.0
         )
-        conteudo = res.choices[0].message.content.strip().replace('"', '').replace("'", "")
+        conteudo = (res.choices[0].message.content or "").strip().replace('"', '').replace("'", "")
         if conteudo:
             prompt_en = conteudo
     except Exception:
@@ -589,7 +603,7 @@ def obter_modelo_para_modo(modo: str, tem_imagem: bool = False, tem_chave: bool 
     if not usa_gemini:
         return "openai"
     if tem_imagem:
-        return "gemini-2.5-flash"
+        return "gemini-2.5-pro" if ("Pensamento Profundo" in modo or "Profundo" in modo) else "gemini-2.5-flash"
     if "Ultra Flash" in modo or "Rápido" in modo:
         return "gemini-2.5-flash-lite"
     elif "Pensamento Profundo" in modo or "Profundo" in modo:
@@ -603,15 +617,14 @@ def gerar_micro_resumo(contexto_historico: str, id_modelo: str, cliente=None) ->
         res = cliente_uso.chat.completions.create(
             model=id_modelo,
             messages=[{"role": "user", "content": f"Sintetize em 1 frase curta o tópico desta conversa:\n\n{contexto_historico}\n\nResumo:"}],
-            max_tokens=50,
-            timeout=10.0
+            timeout=15.0
         )
-        return res.choices[0].message.content.strip()
+        return (res.choices[0].message.content or "").strip()
     except Exception:
         return ""
 
 # =============================================================
-# 7. ⚡ EXECUTOR HÍBRIDO EM STREAMING (MULTIMODAL 2-PASSOS)
+# 7. ⚡ EXECUTOR HÍBRIDO EM STREAMING (MULTIMODAL NATIVO)
 # =============================================================
 
 CACHE_RESPOSTAS_TEMP = {}
@@ -670,15 +683,15 @@ def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, m
     return "O servidor gratuito atingiu o limite momentâneo de requisições. Aguarde alguns segundos ou verifique sua chave do Google AI Studio em '⚙️ Configurações IA' na barra lateral!"
 
 def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexos: list = None, api_key_override: str = ""):
-    """Executa o pipeline multimodal em 2 passos com suporte a Sandbox Python, PDFs, Dados e Imagens."""
+    """Executa o pipeline multimodal nativo com suporte a Sandbox Python, PDFs, Dados e Imagens."""
     if verificar_injecao_prompt(prompt):
         yield "⚠️ **Alerta de Segurança:** Diretriz de proteção ativada contra comandos maliciosos."
         return
 
     anexos = anexos or []
-    tem_pdf = any("pdf" in a.get("tipo", "") for a in anexos)
-    tem_imagem = any("image" in a.get("tipo", "") for a in anexos)
-    tem_tabela = any(a.get("nome", "").lower().endswith(('.csv', '.xls', '.xlsx')) for a in anexos)
+    tem_pdf = any("pdf" in (a.get("tipo") or "").lower() or (a.get("nome") or "").lower().endswith(".pdf") for a in anexos)
+    tem_imagem = any(eh_arquivo_imagem(a) for a in anexos)
+    tem_tabela = any((a.get("nome") or "").lower().endswith(('.csv', '.xls', '.xlsx')) for a in anexos)
     
     chave_ativa = api_key_override.strip() or obter_chave_gemini()
     cliente_ativo = criar_cliente_openai(chave_ativa)
@@ -694,26 +707,35 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     intencao = decisao_llm["intencao"]
 
     if intencao == "GERAR_IMAGEM" and not tem_pdf:
-        imagem_referencia_bytes = next((a["bytes"] for a in anexos if "image" in a.get("tipo", "")), None)
+        anexo_img = next((a for a in anexos if eh_arquivo_imagem(a)), None)
+        imagem_referencia_bytes = anexo_img["bytes"] if anexo_img else None
+        mime_ref = obter_mime_imagem(anexo_img) if anexo_img else "image/png"
         yield "🎨 Analisando diretrizes e sintetizando imagem...\n\n"
         id_modelo_geracao = id_modelo_visao if imagem_referencia_bytes else id_modelo_raciocinio
-        resultado_img = gerar_imagem_local(prompt, id_modelo_geracao, imagem_referencia_bytes=imagem_referencia_bytes, cliente=cliente_ativo)
+        resultado_img = gerar_imagem_local(
+            prompt,
+            id_modelo_geracao,
+            imagem_referencia_bytes=imagem_referencia_bytes,
+            mime_referencia=mime_ref,
+            cliente=cliente_ativo
+        )
         yield resultado_img
         return
 
     contexto_anexos = ""
+    imagens_multimodais = []
     
     # ---------------------------------------------------------
-    # PASSO 1: EXTRAÇÃO DE DADOS (VISÃO, TABELAS E PDF)
+    # PASSO 1: EXTRAÇÃO DE DOCUMENTOS E PREPARAÇÃO MULTIMODAL
     # ---------------------------------------------------------
     if anexos:
         yield "🔍 Lendo documentos e extraindo contexto...\n\n"
         
         for arq in anexos:
             nome_arq = arq.get("nome", "")
-            tipo_arq = arq.get("tipo", "")
+            tipo_arq = (arq.get("tipo") or "").lower()
             
-            if "pdf" in tipo_arq:
+            if "pdf" in tipo_arq or nome_arq.lower().endswith(".pdf"):
                 texto_pdf = extrair_texto_pdf(arq["bytes"])
                 contexto_anexos += f"\n--- CONTEÚDO DO PDF ({nome_arq}) ---\n{texto_pdf[:4000]}...\n"
             
@@ -721,25 +743,19 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
                 texto_tabela = extrair_conteudo_tabela(arq["bytes"], nome_arq)
                 contexto_anexos += f"\n--- DADOS DA TABELA/PLANILHA ({nome_arq}) ---\n{texto_tabela}\n"
 
-            elif "image" in tipo_arq:
-                img_b64 = codificar_imagem_base64(arq["bytes"])
-                try:
-                    res_visao = cliente_ativo.chat.completions.create(
-                        model=id_modelo_visao,
-                        messages=[{"role": "user", "content": [
-                            {"type": "text", "text": "Descreva esta imagem em detalhes absolutos. Extraia todos os textos, dados, cores e formas. Não tire conclusões, apenas relate objetivamente o que vê."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                        ]}],
-                        max_tokens=300,
-                        timeout=20.0
-                    )
-                    desc_img = res_visao.choices[0].message.content.strip()
-                    contexto_anexos += f"\n--- DESCRIÇÃO DA IMAGEM ({nome_arq}) ---\n{desc_img}\n"
-                except Exception as e:
-                    contexto_anexos += f"\n[Falha ao ler a imagem {nome_arq}: {e}]\n"
+            elif eh_arquivo_imagem(arq):
+                imagens_multimodais.append({
+                    "nome": nome_arq,
+                    "mime": obter_mime_imagem(arq),
+                    "b64": codificar_imagem_base64(arq["bytes"])
+                })
+
+    if imagens_multimodais and not chave_ativa:
+        yield "⚠️ **Chave API necessária para visão:** Nenhuma `GEMINI_API_KEY` ativa foi detectada. Cole sua chave em **⚙️ Configurações IA**, clique em **Salvar** (ou salve nos *Secrets* do Streamlit) e envie a imagem novamente."
+        return
 
     # ---------------------------------------------------------
-    # PASSO 2: RACIOCÍNIO CENTRAL E EXECUÇÃO (MODELO PRINCIPAL)
+    # PASSO 2: RACIOCÍNIO CENTRAL E EXECUÇÃO (MULTIMODAL NATIVO)
     # ---------------------------------------------------------
     data_hoje = datetime.now().strftime("%d/%m/%Y")
 
@@ -785,24 +801,32 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         messages.append({"role": "user" if a == "user" else "assistant", "content": t[:1200]})
 
     if intencao == "SALVAR_MEMORIA":
-        messages.append({
-            "role": "user",
-            "content": f"{prompt}\n\n[Instrução Interna: Confirme ao usuário que a informação '{fato_gravado[:200]}' já foi gravada com sucesso no seu banco vetorial ChromaDB.]"
-        })
+        texto_usuario_final = f"{prompt}\n\n[Instrução Interna: Confirme ao usuário que a informação '{fato_gravado[:200]}' já foi gravada com sucesso no seu banco vetorial ChromaDB.]"
     elif contexto_web:
-        prompt_enriquecido = (
+        texto_usuario_final = (
             f"Pergunta do usuário: {prompt}\n\n"
             f"[Instrução Interna: Responda de forma conversacional usando os dados das FONTES VERIFICADAS DA WEB acima. "
             f"Jamais adicione sobrenomes entre parênteses que não estejam nas fontes.]"
         )
-        messages.append({"role": "user", "content": prompt_enriquecido})
     else:
-        messages.append({"role": "user", "content": prompt if prompt.strip() else "Analise os anexos extraídos."})
+        texto_usuario_final = prompt if prompt.strip() else "Analise e descreva os anexos enviados em detalhes."
 
+    if imagens_multimodais:
+        conteudo_multimodal = [{"type": "text", "text": texto_usuario_final}]
+        for img_info in imagens_multimodais:
+            conteudo_multimodal.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{img_info['mime']};base64,{img_info['b64']}"}
+            })
+        messages.append({"role": "user", "content": conteudo_multimodal})
+    else:
+        messages.append({"role": "user", "content": texto_usuario_final})
+
+    modelo_execucao = id_modelo_visao if imagens_multimodais else id_modelo_raciocinio
     resposta_acumulada = ""
     try:
         stream = cliente_ativo.chat.completions.create(
-            model=id_modelo_raciocinio,
+            model=modelo_execucao,
             messages=messages,
             temperature=0.2 if intencao == "BUSCA_WEB" else 0.7,
             stream=True
@@ -816,7 +840,11 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
             
     except Exception as e:
-        print(f"⚠️ API principal oscilou ({e}). Acionando contingência multi-modelo...")
+        print(f"⚠️ API principal oscilou ({e}).")
+        if imagens_multimodais:
+            erro_limpo = str(e).replace(chave_ativa, "***") if chave_ativa else str(e)
+            yield f"⚠️ **Falha ao analisar a imagem na API do Gemini:** `{erro_limpo[:260]}`\n\nVerifique se a chave foi salva corretamente clicando em **Salvar** em **⚙️ Configurações IA** e se a cota da API está ativa."
+            return
         resposta_fallback = gerar_resposta_contingencia(
             prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages, fato_gravado=fato_gravado
         )
