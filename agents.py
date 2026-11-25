@@ -73,24 +73,26 @@ def obter_chave_gemini() -> str:
 
     return ""
 
+def criar_cliente_openai(chave_override: str = "") -> OpenAI:
+    """Instancia o cliente OpenAI conectado à API oficial do Gemini ou ao fallback gratuito."""
+    chave = chave_override.strip() if chave_override else obter_chave_gemini()
+    if chave:
+        return OpenAI(
+            base_url=GEMINI_BASE_URL,
+            api_key=chave,
+            timeout=90.0
+        )
+    return OpenAI(
+        base_url=FREE_LLM_BASE_URL,
+        api_key="lume-free-llm",
+        timeout=90.0
+    )
+
 class ClienteDinamicoOpenAI:
     """Conecta à API oficial do Gemini quando há chave ou usa o LLM gratuito automaticamente."""
     @property
     def chat(self):
-        chave = obter_chave_gemini()
-        if chave:
-            cliente = OpenAI(
-                base_url=GEMINI_BASE_URL,
-                api_key=chave,
-                timeout=90.0
-            )
-        else:
-            cliente = OpenAI(
-                base_url=FREE_LLM_BASE_URL,
-                api_key="lume-free-llm",
-                timeout=90.0
-            )
-        return cliente.chat
+        return criar_cliente_openai().chat
 
 client_local = ClienteDinamicoOpenAI()
 
@@ -372,8 +374,9 @@ def limpar_texto_geracao(prompt: str) -> str:
         p = re.sub(rf'\b{re.escape(termo)}\b', ' ', p)
     return " ".join(p.split())
 
-def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prompt_en: str, id_modelo: str) -> str:
+def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prompt_en: str, id_modelo: str, cliente=None) -> str:
     """Analisa a imagem gerada via VLM e grava os aprendizados de estilo no ChromaDB."""
+    cliente_uso = cliente or client_local
     try:
         if not os.path.exists(caminho_imagem):
             return ""
@@ -387,7 +390,7 @@ def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prom
             f"enquadramento e fidelidade temática."
         )
 
-        res = client_local.chat.completions.create(
+        res = cliente_uso.chat.completions.create(
             model=id_modelo,
             messages=[{
                 "role": "user",
@@ -411,8 +414,9 @@ def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prom
         print(f"⚠️ Crítico visual indisponível ou timeout: {e}")
         return ""
 
-def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None) -> str:
+def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None, cliente=None) -> str:
     """Consulta memórias passadas, traduz o prompt (ou analisa imagem base), sintetiza a imagem e autoavalia."""
+    cliente_uso = cliente or client_local
     os.makedirs("geracoes_lume", exist_ok=True)
     
     termo_limpo = limpar_texto_geracao(prompt_usuario)
@@ -447,7 +451,7 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
                 f"Subject: '{termo_limpo}'\n\nPrompt:"
             )
 
-        res = client_local.chat.completions.create(
+        res = cliente_uso.chat.completions.create(
             model=id_modelo,
             messages=[{"role": "user", "content": conteudo_msg}],
             max_tokens=60,
@@ -487,7 +491,7 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
     except Exception as e:
         return f"⚠️ Falha na geração de imagem: {e}."
 
-    critica_visual = autoavaliar_e_aprender_imagem(caminho_salvo, termo_limpo, prompt_en, id_modelo)
+    critica_visual = autoavaliar_e_aprender_imagem(caminho_salvo, termo_limpo, prompt_en, id_modelo, cliente=cliente_uso)
     feedback_txt = f"\n\n🔍 **Autoavaliação Lume:** {critica_visual}" if critica_visual else ""
 
     return f"🎨 Imagem sintetizada com base na sua diretriz visual!{feedback_txt}\n\n[IMAGEM_GERADA:{caminho_salvo}]"
@@ -567,22 +571,24 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
 # 6. ⚙️ SELEÇÃO DINÂMICA DE MODELOS (API GEMINI + FALLBACK)
 # =============================================================
 
-def obter_modelo_para_modo(modo: str, tem_imagem: bool = False) -> str:
+def obter_modelo_para_modo(modo: str, tem_imagem: bool = False, tem_chave: bool = None) -> str:
     """Seleciona o modelo da família Gemini 2.5 quando há chave ou usa o modelo gratuito padrão."""
-    if not obter_chave_gemini():
+    usa_gemini = tem_chave if tem_chave is not None else bool(obter_chave_gemini())
+    if not usa_gemini:
         return "openai"
     if tem_imagem:
         return "gemini-2.5-flash"
-    if "Ultra Flash" in modo:
+    if "Ultra Flash" in modo or "Rápido" in modo:
         return "gemini-2.5-flash-lite"
-    elif "Pensamento Profundo" in modo:
+    elif "Pensamento Profundo" in modo or "Profundo" in modo:
         return "gemini-2.5-pro"
     return "gemini-2.5-flash"
 
-def gerar_micro_resumo(contexto_historico: str, id_modelo: str) -> str:
+def gerar_micro_resumo(contexto_historico: str, id_modelo: str, cliente=None) -> str:
     """Gera um resumo semântico curto para arquivamento no ChromaDB."""
+    cliente_uso = cliente or client_local
     try:
-        res = client_local.chat.completions.create(
+        res = cliente_uso.chat.completions.create(
             model=id_modelo,
             messages=[{"role": "user", "content": f"Sintetize em 1 frase curta o tópico desta conversa:\n\n{contexto_historico}\n\nResumo:"}],
             max_tokens=50,
@@ -618,7 +624,7 @@ def extrair_fato_para_salvar(prompt: str, mensagens_anteriores: list) -> str:
 def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list, fato_gravado: str = "") -> str:
     """Tenta múltiplos modelos gratuitos antes de recorrer à síntese local."""
     if intencao == "SALVAR_MEMORIA" and fato_gravado:
-        return f"✅ **Informação registrada com sucesso no meu banco vetorial (ChromaDB)!**\n\n> *{fato_gravado}*\n\nVocê já pode consultar ou editar esse registro abrindo a aba **⚙️ Gerenciar Banco Vetorial** na barra lateral esquerda."
+        return f"✅ **Informação registrada com sucesso no meu banco vetorial (ChromaDB)!**\n\n> *{fato_gravado}*\n\nVocê já pode consultar ou editar esse registro abrindo a aba **🗄️ Memória (ChromaDB)**."
 
     for modelo_alt in ["openai", "mistral", "openai-fast"]:
         try:
@@ -649,9 +655,9 @@ def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, m
     if memoria_vetorial:
         return f"Consultando minha memória pessoal (ChromaDB), encontrei estes registros:\n\n{memoria_vetorial}"
 
-    return "O servidor gratuito atingiu o limite momentâneo de requisições. Aguarde alguns segundos ou insira sua chave gratuita do Google AI Studio em '🔑 Configurar API' na barra lateral!"
+    return "O servidor gratuito atingiu o limite momentâneo de requisições. Aguarde alguns segundos ou verifique sua chave do Google AI Studio em '⚙️ Configurações IA' na barra lateral!"
 
-def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexos: list = None):
+def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexos: list = None, api_key_override: str = ""):
     """Executa o pipeline multimodal em 2 passos com suporte a Sandbox Python, PDFs, Dados e Imagens."""
     if verificar_injecao_prompt(prompt):
         yield "⚠️ **Alerta de Segurança:** Diretriz de proteção ativada contra comandos maliciosos."
@@ -662,8 +668,10 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     tem_imagem = any("image" in a.get("tipo", "") for a in anexos)
     tem_tabela = any(a.get("nome", "").lower().endswith(('.csv', '.xls', '.xlsx')) for a in anexos)
     
-    id_modelo_raciocinio = obter_modelo_para_modo(modo, tem_imagem=False)
-    id_modelo_visao = obter_modelo_para_modo(modo, tem_imagem=True)
+    chave_ativa = api_key_override.strip() or obter_chave_gemini()
+    cliente_ativo = criar_cliente_openai(chave_ativa)
+    id_modelo_raciocinio = obter_modelo_para_modo(modo, tem_imagem=False, tem_chave=bool(chave_ativa))
+    id_modelo_visao = obter_modelo_para_modo(modo, tem_imagem=True, tem_chave=bool(chave_ativa))
 
     mensagens_anteriores = carregar_mensagens(conversa_id)[-6:]
     ultimas_msgs_usuario = " ".join([t for a, t, _ in mensagens_anteriores[-4:] if a == "user"])
@@ -677,7 +685,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
         imagem_referencia_bytes = next((a["bytes"] for a in anexos if "image" in a.get("tipo", "")), None)
         yield "🎨 Analisando diretrizes e sintetizando imagem...\n\n"
         id_modelo_geracao = id_modelo_visao if imagem_referencia_bytes else id_modelo_raciocinio
-        resultado_img = gerar_imagem_local(prompt, id_modelo_geracao, imagem_referencia_bytes=imagem_referencia_bytes)
+        resultado_img = gerar_imagem_local(prompt, id_modelo_geracao, imagem_referencia_bytes=imagem_referencia_bytes, cliente=cliente_ativo)
         yield resultado_img
         return
 
@@ -704,7 +712,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             elif "image" in tipo_arq:
                 img_b64 = codificar_imagem_base64(arq["bytes"])
                 try:
-                    res_visao = client_local.chat.completions.create(
+                    res_visao = cliente_ativo.chat.completions.create(
                         model=id_modelo_visao,
                         messages=[{"role": "user", "content": [
                             {"type": "text", "text": "Descreva esta imagem em detalhes absolutos. Extraia todos os textos, dados, cores e formas. Não tire conclusões, apenas relate objetivamente o que vê."},
@@ -781,7 +789,7 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
 
     resposta_acumulada = ""
     try:
-        stream = client_local.chat.completions.create(
+        stream = cliente_ativo.chat.completions.create(
             model=id_modelo_raciocinio,
             messages=messages,
             temperature=0.2 if intencao == "BUSCA_WEB" else 0.7,
@@ -823,6 +831,6 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             print(f"⚠️ Falha no Code Interpreter pós-processamento: {e}")
 
     if resposta_acumulada and "⚠️" not in resposta_acumulada:
-        resumo = gerar_micro_resumo(f"Usuário: {prompt}\nLume: {resposta_acumulada}", id_modelo_raciocinio)
+        resumo = gerar_micro_resumo(f"Usuário: {prompt}\nLume: {resposta_acumulada}", id_modelo_raciocinio, cliente=cliente_ativo)
         if resumo:
             salvar_ou_atualizar_resumo_chat(conversa_id, f"Chat {conversa_id}: {resumo}")
