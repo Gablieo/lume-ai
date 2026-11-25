@@ -40,14 +40,19 @@ except ImportError:
 
 from database import carregar_mensagens
 from vector_db import (
-    consultar_memoria, 
-    salvar_memoria, 
-    consultar_resumos_chats, 
+    consultar_memoria,
+    salvar_memoria,
+    consultar_resumos_chats,
     salvar_ou_atualizar_resumo_chat
 )
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 FREE_LLM_BASE_URL = "https://text.pollinations.ai/openai"
+
+# Cache em memória dos modelos Gemini ativos descobertos por chave
+CACHE_MODELOS_GEMINI = {}
+
 
 def obter_chave_gemini() -> str:
     """Busca a chave na sessão da barra lateral, variável de ambiente ou Secrets do Streamlit."""
@@ -73,6 +78,93 @@ def obter_chave_gemini() -> str:
 
     return ""
 
+
+def descobrir_modelos_gemini(chave: str) -> list[str]:
+    """Consulta a API nativa do Google para listar modelos Gemini ativos que suportam generateContent."""
+    if not chave:
+        return []
+
+    chave_id = chave[-12:]
+    if chave_id in CACHE_MODELOS_GEMINI and CACHE_MODELOS_GEMINI[chave_id]:
+        return CACHE_MODELOS_GEMINI[chave_id]
+
+    termos_ignorar = [
+        "embedding", "aqa", "imagen", "veo", "tts", "audio", "live",
+        "robotics", "computer-use", "deep-research", "image-generation",
+        "image-preview", "-image"
+    ]
+
+    try:
+        resp = requests.get(
+            f"{GEMINI_NATIVE_BASE_URL}/models",
+            params={"key": chave},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            modelos_validos = []
+            for m in resp.json().get("models", []):
+                metodos = m.get("supportedGenerationMethods", [])
+                if "generateContent" not in metodos:
+                    continue
+                nome = m.get("name", "").replace("models/", "").strip()
+                nome_low = nome.lower()
+                if "gemini" not in nome_low:
+                    continue
+                if any(t in nome_low for t in termos_ignorar):
+                    continue
+                modelos_validos.append(nome)
+
+            if modelos_validos:
+                CACHE_MODELOS_GEMINI[chave_id] = modelos_validos
+                return modelos_validos
+    except Exception as e:
+        print(f"⚠️ Não foi possível listar modelos Gemini automaticamente: {e}")
+
+    return []
+
+
+def _chave_ordenacao_modelo(nome: str) -> tuple:
+    """Prioriza versões mais recentes e modelos estáveis sobre previews/experimentais."""
+    n = nome.lower()
+    m = re.search(r'gemini-(\d+)(?:\.(\d+))?', n)
+    major = int(m.group(1)) if m else 0
+    minor = int(m.group(2)) if (m and m.group(2)) else 0
+    eh_estavel = 0 if ("exp" in n or "preview" in n) else 1
+    eh_latest = 1 if "latest" in n else 0
+    return (major, minor, eh_estavel, eh_latest, n)
+
+
+def listar_candidatos_gemini(modo: str, chave: str, tem_imagem: bool = False) -> list[str]:
+    """Retorna lista ordenada de modelos Gemini válidos para o perfil de raciocínio escolhido."""
+    disponiveis = descobrir_modelos_gemini(chave)
+
+    if not disponiveis:
+        if "Pensamento Profundo" in modo or "Profundo" in modo:
+            return ["gemini-2.5-pro", "gemini-pro-latest", "gemini-2.5-flash", "gemini-flash-latest"]
+        if "Ultra Flash" in modo or "Rápido" in modo:
+            return ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
+        return ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash", "gemini-2.5-pro"]
+
+    flash_lite = sorted([m for m in disponiveis if "flash-lite" in m.lower()], key=_chave_ordenacao_modelo, reverse=True)
+    flash_padrao = sorted([m for m in disponiveis if "flash" in m.lower() and "lite" not in m.lower()], key=_chave_ordenacao_modelo, reverse=True)
+    pro_modelos = sorted([m for m in disponiveis if "pro" in m.lower()], key=_chave_ordenacao_modelo, reverse=True)
+    outros = sorted(disponiveis, key=_chave_ordenacao_modelo, reverse=True)
+
+    if "Pensamento Profundo" in modo or "Profundo" in modo:
+        ordem = pro_modelos + flash_padrao + flash_lite + outros
+    elif ("Ultra Flash" in modo or "Rápido" in modo) and not tem_imagem:
+        ordem = flash_lite + flash_padrao + pro_modelos + outros
+    else:
+        ordem = flash_padrao + pro_modelos + flash_lite + outros
+
+    # Remove duplicados preservando a prioridade
+    unicos = []
+    for m in ordem:
+        if m not in unicos:
+            unicos.append(m)
+    return unicos
+
+
 def criar_cliente_openai(chave_override: str = "") -> OpenAI:
     """Instancia o cliente OpenAI conectado à API oficial do Gemini ou ao fallback gratuito."""
     chave = chave_override.strip() if chave_override else obter_chave_gemini()
@@ -88,13 +180,93 @@ def criar_cliente_openai(chave_override: str = "") -> OpenAI:
         timeout=90.0
     )
 
+
 class ClienteDinamicoOpenAI:
     """Conecta à API oficial do Gemini quando há chave ou usa o LLM gratuito automaticamente."""
     @property
     def chat(self):
         return criar_cliente_openai().chat
 
+
 client_local = ClienteDinamicoOpenAI()
+
+
+def chamar_gemini_nativo(
+    chave: str,
+    modelos_candidatos: list[str],
+    system_text: str,
+    historico_mensagens: list,
+    texto_usuario: str,
+    imagens: list = None,
+    temperature: float = 0.5
+) -> tuple[bool, str]:
+    """Chama a API REST nativa do Gemini (generateContent) com suporte completo a imagens inline_data."""
+    contents = []
+
+    for autor, texto in historico_mensagens:
+        if not texto or not texto.strip():
+            continue
+        role = "user" if autor == "user" else "model"
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"].append({"text": texto[:1200]})
+        else:
+            contents.append({"role": role, "parts": [{"text": texto[:1200]}]})
+
+    partes_atuais = [{"text": texto_usuario}]
+    for img in (imagens or []):
+        partes_atuais.append({
+            "inline_data": {
+                "mime_type": img["mime"],
+                "data": img["b64"]
+            }
+        })
+
+    if contents and contents[-1]["role"] == "user":
+        contents[-1]["parts"].extend(partes_atuais)
+    else:
+        contents.append({"role": "user", "parts": partes_atuais})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {"temperature": temperature}
+    }
+    if system_text:
+        payload["system_instruction"] = {"parts": [{"text": system_text}]}
+
+    ultimo_erro = "Nenhum modelo Gemini disponível respondeu."
+
+    for modelo in modelos_candidatos[:4]:
+        try:
+            resp = requests.post(
+                f"{GEMINI_NATIVE_BASE_URL}/models/{modelo}:generateContent",
+                params={"key": chave},
+                json=payload,
+                timeout=60
+            )
+            if resp.status_code == 200:
+                dados = resp.json()
+                candidatos = dados.get("candidates", [])
+                if candidatos:
+                    partes_resp = candidatos[0].get("content", {}).get("parts", [])
+                    texto_final = "".join(
+                        p.get("text", "") for p in partes_resp if not p.get("thought", False)
+                    ).strip()
+                    if texto_final:
+                        return True, texto_final
+                ultimo_erro = f"Resposta vazia do modelo {modelo}."
+            else:
+                try:
+                    msg_err = resp.json().get("error", {}).get("message", resp.text[:240])
+                except Exception:
+                    msg_err = resp.text[:240]
+                ultimo_erro = f"HTTP {resp.status_code} ({modelo}): {msg_err}"
+                # Se a chave for inválida ou sem permissão, não adianta tentar outros modelos
+                if resp.status_code in (400, 401, 403) and "key" in msg_err.lower():
+                    return False, ultimo_erro
+        except Exception as e:
+            ultimo_erro = f"Erro de conexão ({modelo}): {e}"
+
+    return False, ultimo_erro
 
 # =============================================================
 # 1. 🛡️ FIREWALL DE SEGURANÇA E PRIVACIDADE E FERRAMENTAS
@@ -109,9 +281,9 @@ def mascarar_dados_sensiveis(texto: str) -> str:
 
 def verificar_injecao_prompt(prompt: str) -> bool:
     padroes_maliciosos = [
-        "ignore as instruções", "ignore todas as instruções", "esqueça as regras", 
-        "desconsidere as regras", "system prompt", "modo desenvolvedor", 
-        "dan mode", "você agora é", "you are now", "bypassar", 
+        "ignore as instruções", "ignore todas as instruções", "esqueça as regras",
+        "desconsidere as regras", "system prompt", "modo desenvolvedor",
+        "dan mode", "você agora é", "you are now", "bypassar",
         "quais são suas instruções", "revele seu prompt"
     ]
     return any(p in prompt.lower() for p in padroes_maliciosos)
@@ -158,7 +330,7 @@ def extrair_conteudo_tabela(arquivo_bytes: bytes, nome_arquivo: str) -> str:
             df = pd.read_excel(io.BytesIO(arquivo_bytes))
         else:
             return ""
-        
+
         info = (
             f"Dimensões: {df.shape[0]} linhas x {df.shape[1]} colunas\n"
             f"Colunas: {', '.join(df.columns.astype(str))}\n"
@@ -178,9 +350,9 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
     os.makedirs("geracoes_lume", exist_ok=True)
     output_buffer = io.StringIO()
     caminho_grafico = None
-    
+
     cod_limpo = re.sub(r"^```(?:python)?\s*|\s*```$", "", codigo_python.strip(), flags=re.MULTILINE)
-    
+
     namespace_global = {
         "__builtins__": __builtins__,
         "os": os,
@@ -190,7 +362,7 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         "time": time,
         "json": json
     }
-    
+
     try:
         import numpy as np
         namespace_global["np"] = np
@@ -209,11 +381,11 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        
+
         plt.show = lambda *args, **kwargs: None
         plt.clf()
         plt.close('all')
-        
+
         namespace_global["plt"] = plt
         namespace_global["matplotlib"] = matplotlib
     except ImportError:
@@ -222,13 +394,13 @@ def executar_codigo_sandbox(codigo_python: str) -> dict:
     try:
         with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
             exec(cod_limpo, namespace_global)
-        
+
         if plt and len(plt.get_fignums()) > 0:
             timestamp = int(time.time())
             caminho_grafico = os.path.join("geracoes_lume", f"plot_{timestamp}.png")
             plt.savefig(caminho_grafico, bbox_inches="tight", dpi=150)
             plt.close('all')
-            
+
         saida = output_buffer.getvalue().strip()
         return {
             "sucesso": True,
@@ -260,20 +432,20 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
 
     # Coloca o prompt atual primeiro para nunca cortar o assunto principal
     texto_base = f"{prompt_lower} {contexto_recente.lower()}" if precisa_contexto else prompt_lower
-    
+
     # Atalho cirúrgico para consultas sobre eleições presidenciais de 2026
     if any(t in texto_base for t in ["eleições", "eleicao", "presidente", "segundo turno"]) and "2026" in texto_base:
         return "resultado segundo turno eleicoes presidente brasil 2026 lula flavio bolsonaro tse", True
 
     termos_noticia = [
-        "noticia", "notícia", "noticias", "notícias", "ultimas", "últimas", 
-        "hoje", "acontecendo", "lançamento", "lancamentos", "eleições", 
+        "noticia", "notícia", "noticias", "notícias", "ultimas", "últimas",
+        "hoje", "acontecendo", "lançamento", "lancamentos", "eleições",
         "eleicao", "presidente", "ganhou", "venceu", "resultado", "turno",
-        "votos", "disputa", "disputou", "acirrada", "bolsonaro", "flávio", 
+        "votos", "disputa", "disputou", "acirrada", "bolsonaro", "flávio",
         "flavio", "lula", "2026", "2025"
     ]
     eh_noticia = any(t in texto_base for t in termos_noticia)
-    
+
     stopwords_busca = [
         "procure na internet", "pesquise na internet", "busque na internet",
         "procure na web", "pesquise na web", "busque na web",
@@ -286,28 +458,28 @@ def otimizar_query_busca(prompt: str, contexto_recente: str = "") -> tuple[str, 
         "bem", "muito", "sobre", "para", "com", "que", "uma", "uns",
         "mas", "ele", "ela", "não", "nao", "sim", "então", "entao", "quantos"
     ]
-    
+
     termo = texto_base
     for sw in stopwords_busca:
         termo = re.sub(rf'\b{re.escape(sw)}\b', ' ', termo)
-    
+
     termo = re.sub(r'[^\w\s]', ' ', termo)
     palavras = []
     for p in termo.split():
         if len(p) > 2 or p.isdigit():
             if p not in palavras:
                 palavras.append(p)
-    
+
     termo_limpo = " ".join(palavras[:6])
     ano_atual = datetime.now().year
-    
+
     if eh_noticia:
         if not termo_limpo:
             return f"principais noticias brasil {ano_atual}", True
         if str(ano_atual) not in termo_limpo and "2025" not in termo_limpo:
             return f"{termo_limpo} {ano_atual}", True
         return termo_limpo, True
-        
+
     return (termo_limpo if termo_limpo else prompt), False
 
 def pesquisar_web_direta(query: str, contexto_recente: str = "") -> str:
@@ -402,9 +574,8 @@ def limpar_texto_geracao(prompt: str) -> str:
         p = re.sub(rf'\b{re.escape(termo)}\b', ' ', p)
     return " ".join(p.split())
 
-def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prompt_en: str, id_modelo: str, cliente=None) -> str:
+def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prompt_en: str, id_modelo: str, cliente=None, chave_gemini: str = "") -> str:
     """Analisa a imagem gerada via VLM e grava os aprendizados de estilo no ChromaDB."""
-    cliente_uso = cliente or client_local
     try:
         if not os.path.exists(caminho_imagem):
             return ""
@@ -418,20 +589,34 @@ def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prom
             f"enquadramento e fidelidade temática."
         )
 
-        res = cliente_uso.chat.completions.create(
-            model=id_modelo,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_critico},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
-                ]
-            }],
-            timeout=25.0
-        )
+        critica = ""
+        if chave_gemini:
+            ok, texto_resp = chamar_gemini_nativo(
+                chave=chave_gemini,
+                modelos_candidatos=listar_candidatos_gemini("Padrão", chave_gemini, tem_imagem=True),
+                system_text="",
+                historico_mensagens=[],
+                texto_usuario=prompt_critico,
+                imagens=[{"mime": "image/png", "b64": b64_img}],
+                temperature=0.4
+            )
+            if ok:
+                critica = texto_resp
+        else:
+            cliente_uso = cliente or client_local
+            res = cliente_uso.chat.completions.create(
+                model=id_modelo,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_critico},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
+                    ]
+                }],
+                timeout=25.0
+            )
+            critica = (res.choices[0].message.content or "").strip()
 
-        critica = (res.choices[0].message.content or "").strip()
-        
         if critica and "⚠️" not in critica:
             fato_aprendizado = f"Estilo e composição visual bem-sucedidos para '{prompt_usuario}': prompt usado ('{prompt_en}'). Análise: {critica}"
             salvar_memoria(fato_aprendizado, usuario="lume_vision_critic")
@@ -441,11 +626,11 @@ def autoavaliar_e_aprender_imagem(caminho_imagem: str, prompt_usuario: str, prom
         print(f"⚠️ Crítico visual indisponível ou timeout: {e}")
         return ""
 
-def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None, mime_referencia: str = "image/png", cliente=None) -> str:
+def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_bytes: bytes = None, mime_referencia: str = "image/png", cliente=None, chave_gemini: str = "") -> str:
     """Consulta memórias passadas, traduz o prompt (ou analisa imagem base), sintetiza a imagem e autoavalia."""
     cliente_uso = cliente or client_local
     os.makedirs("geracoes_lume", exist_ok=True)
-    
+
     termo_limpo = limpar_texto_geracao(prompt_usuario)
     if not termo_limpo.strip() and not imagem_referencia_bytes:
         termo_limpo = "lume artificial intelligence neural sphere glowing"
@@ -456,20 +641,24 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
     prompt_en = termo_limpo
 
     try:
-        if imagem_referencia_bytes:
+        if imagem_referencia_bytes and chave_gemini:
             b64_ref = codificar_imagem_base64(imagem_referencia_bytes)
-            conteudo_msg = [
-                {
-                    "type": "text", 
-                    "text": (
-                        f"Analyze this reference image and the user directive: '{prompt_usuario}'. "
-                        f"Extract its visual style, colors, lighting, and subject to create a concise, high quality "
-                        f"English descriptive diffusion prompt that recreates/evolves this concept. "
-                        f"Return ONLY the English prompt text."
-                    )
-                },
-                {"type": "image_url", "image_url": {"url": f"data:{mime_referencia};base64,{b64_ref}"}}
-            ]
+            ok, conteudo = chamar_gemini_nativo(
+                chave=chave_gemini,
+                modelos_candidatos=listar_candidatos_gemini("Padrão", chave_gemini, tem_imagem=True),
+                system_text="",
+                historico_mensagens=[],
+                texto_usuario=(
+                    f"Analyze this reference image and the user directive: '{prompt_usuario}'. "
+                    f"Extract its visual style, colors, lighting, and subject to create a concise, high quality "
+                    f"English descriptive diffusion prompt that recreates/evolves this concept. "
+                    f"Return ONLY the English prompt text."
+                ),
+                imagens=[{"mime": mime_referencia, "b64": b64_ref}],
+                temperature=0.5
+            )
+            if ok and conteudo:
+                prompt_en = conteudo.strip().replace('"', '').replace("'", "")
         else:
             conteudo_msg = (
                 f"Translate the following subject into a concise English descriptive prompt for an image generator. "
@@ -477,19 +666,18 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
                 f"Never include humans or portraits unless explicitly requested.{contexto_memoria}\n\n"
                 f"Subject: '{termo_limpo}'\n\nPrompt:"
             )
-
-        res = cliente_uso.chat.completions.create(
-            model=id_modelo,
-            messages=[{"role": "user", "content": conteudo_msg}],
-            timeout=25.0
-        )
-        conteudo = (res.choices[0].message.content or "").strip().replace('"', '').replace("'", "")
-        if conteudo:
-            prompt_en = conteudo
+            res = cliente_uso.chat.completions.create(
+                model=id_modelo,
+                messages=[{"role": "user", "content": conteudo_msg}],
+                timeout=25.0
+            )
+            conteudo = (res.choices[0].message.content or "").strip().replace('"', '').replace("'", "")
+            if conteudo:
+                prompt_en = conteudo
     except Exception:
         dicionario_rapido = {
-            "piano": "grand piano in a room, aesthetic lighting, photorealistic, 8k", 
-            "gato": "cute domestic cat, detailed fur, studio lighting, highly detailed", 
+            "piano": "grand piano in a room, aesthetic lighting, photorealistic, 8k",
+            "gato": "cute domestic cat, detailed fur, studio lighting, highly detailed",
             "carro": "modern sports car, cinematic shot, 8k",
             "lume": "glowing golden neural AI core, futuristic energy sphere, digital particles, dark background, 8k"
         }
@@ -506,7 +694,7 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
         semente_aleatoria = random.randint(1, 999999)
         prompt_codificado = urllib.parse.quote(prompt_en)
         url_imagem = f"https://image.pollinations.ai/prompt/{prompt_codificado}?width=1024&height=1024&nologo=true&seed={semente_aleatoria}"
-        
+
         resp_img = requests.get(url_imagem, timeout=30)
         if resp_img.status_code == 200:
             caminho_salvo = os.path.join("geracoes_lume", f"img_{timestamp}.png")
@@ -517,7 +705,9 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
     except Exception as e:
         return f"⚠️ Falha na geração de imagem: {e}."
 
-    critica_visual = autoavaliar_e_aprender_imagem(caminho_salvo, termo_limpo, prompt_en, id_modelo, cliente=cliente_uso)
+    critica_visual = autoavaliar_e_aprender_imagem(
+        caminho_salvo, termo_limpo, prompt_en, id_modelo, cliente=cliente_uso, chave_gemini=chave_gemini
+    )
     feedback_txt = f"\n\n🔍 **Autoavaliação Lume:** {critica_visual}" if critica_visual else ""
 
     return f"🎨 Imagem sintetizada com base na sua diretriz visual!{feedback_txt}\n\n[IMAGEM_GERADA:{caminho_salvo}]"
@@ -528,7 +718,7 @@ def gerar_imagem_local(prompt_usuario: str, id_modelo: str, imagem_referencia_by
 
 def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bool, historico_txt: str = "") -> dict:
     """Garante que comandos de memória, código e imagem nunca sejam sobrescritos pelo histórico de busca."""
-    
+
     if tem_anexos and not prompt.strip():
         return {"intencao": "DIRETO", "parametros": {}}
 
@@ -538,7 +728,7 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
     # PRIORIDADE 1: SALVAR NA MEMÓRIA VETORIAL (CHROMADB)
     gatilhos_salvar = [
         "registre", "registrar", "banco vetorial", "chromadb", "armazene", "armazenar",
-        "guarde", "guardar", "lembre", "lembrar", "salve", "salvar", "memorize", 
+        "guarde", "guardar", "lembre", "lembrar", "salve", "salvar", "memorize",
         "memorizar", "anote", "anotar", "grave", "gravar na memória", "sua memória"
     ]
     if any(g in p for g in gatilhos_salvar):
@@ -546,7 +736,7 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
 
     # PRIORIDADE 2: CONSULTAR MEMÓRIA PESSOAL
     gatilhos_memoria = [
-        "sobre o biel", "sobre o gabriel", "sobre seu criador", "quem sou eu", 
+        "sobre o biel", "sobre o gabriel", "sobre seu criador", "quem sou eu",
         "meu nome", "minhas preferências", "quem te criou", "o que você sabe sobre mim",
         "o que está salvo", "quais memórias"
     ]
@@ -555,8 +745,8 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
 
     # PRIORIDADE 3: GERAR IMAGEM
     gatilhos_imagem = [
-        "gere uma imagem", "gerar imagem", "crie uma imagem", "criar imagem", 
-        "faça uma imagem", "desenhe", "ilustre", "ilustrar", "visualizar como", 
+        "gere uma imagem", "gerar imagem", "crie uma imagem", "criar imagem",
+        "faça uma imagem", "desenhe", "ilustre", "ilustrar", "visualizar como",
         "renderize uma imagem", "foto realista", "arte digital", "usando essa como base"
     ]
     if any(g in p for g in gatilhos_imagem):
@@ -564,7 +754,7 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
 
     # PRIORIDADE 4: EXECUTAR CÓDIGO / GRÁFICOS
     gatilhos_codigo = [
-        "python", "código", "codigo", "script", "plot", "plote", "gráfico", 
+        "python", "código", "codigo", "script", "plot", "plote", "gráfico",
         "grafico", "matplotlib", "seaborn", "calcule", "simule", "dataframe"
     ]
     if any(c in p for c in gatilhos_codigo):
@@ -574,9 +764,9 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
     gatilhos_forcar_web = [
         "eleições", "eleicao", "eleito", "presidente", "quem ganhou", "quem venceu",
         "segundo turno", "primeiro turno", "acirrada", "disputa", "disputou", "adversário",
-        "quantos %", "porcentagem", "votos", "bolsonaro", "flávio", "flavio", "lula", 
-        "boulos", "tarcísio", "tarcisio", "2025", "2026", "notícias", "noticia", 
-        "ultimas", "últimas", "clima", "previsão", "tempo hoje", "cotação", "dólar", 
+        "quantos %", "porcentagem", "votos", "bolsonaro", "flávio", "flavio", "lula",
+        "boulos", "tarcísio", "tarcisio", "2025", "2026", "notícias", "noticia",
+        "ultimas", "últimas", "clima", "previsão", "tempo hoje", "cotação", "dólar",
         "bitcoin", "pesquise", "busque", "procure na web", "na internet"
     ]
     if any(g in p for g in gatilhos_forcar_web):
@@ -597,23 +787,30 @@ def classificar_intencao_inteligente(prompt: str, id_modelo: str, tem_anexos: bo
 # 6. ⚙️ SELEÇÃO DINÂMICA DE MODELOS (API GEMINI + FALLBACK)
 # =============================================================
 
-def obter_modelo_para_modo(modo: str, tem_imagem: bool = False, tem_chave: bool = None) -> str:
-    """Seleciona o modelo da família Gemini 2.5 quando há chave ou usa o modelo gratuito padrão."""
-    usa_gemini = tem_chave if tem_chave is not None else bool(obter_chave_gemini())
+def obter_modelo_para_modo(modo: str, tem_imagem: bool = False, tem_chave: bool = None, chave: str = "") -> str:
+    """Seleciona o modelo Gemini ativo descoberto dinamicamente ou usa o modelo gratuito padrão."""
+    chave_uso = chave or obter_chave_gemini()
+    usa_gemini = tem_chave if tem_chave is not None else bool(chave_uso)
     if not usa_gemini:
         return "openai"
-    if tem_imagem:
-        return "gemini-2.5-pro" if ("Pensamento Profundo" in modo or "Profundo" in modo) else "gemini-2.5-flash"
-    if "Ultra Flash" in modo or "Rápido" in modo:
-        return "gemini-2.5-flash-lite"
-    elif "Pensamento Profundo" in modo or "Profundo" in modo:
-        return "gemini-2.5-pro"
-    return "gemini-2.5-flash"
+    candidatos = listar_candidatos_gemini(modo, chave_uso, tem_imagem=tem_imagem)
+    return candidatos[0] if candidatos else "gemini-2.5-flash"
 
-def gerar_micro_resumo(contexto_historico: str, id_modelo: str, cliente=None) -> str:
+def gerar_micro_resumo(contexto_historico: str, id_modelo: str, cliente=None, chave_gemini: str = "") -> str:
     """Gera um resumo semântico curto para arquivamento no ChromaDB."""
-    cliente_uso = cliente or client_local
     try:
+        if chave_gemini:
+            ok, texto = chamar_gemini_nativo(
+                chave=chave_gemini,
+                modelos_candidatos=listar_candidatos_gemini("Rápido", chave_gemini),
+                system_text="",
+                historico_mensagens=[],
+                texto_usuario=f"Sintetize em 1 frase curta o tópico desta conversa:\n\n{contexto_historico}\n\nResumo:",
+                temperature=0.3
+            )
+            return texto if ok else ""
+
+        cliente_uso = cliente or client_local
         res = cliente_uso.chat.completions.create(
             model=id_modelo,
             messages=[{"role": "user", "content": f"Sintetize em 1 frase curta o tópico desta conversa:\n\n{contexto_historico}\n\nResumo:"}],
@@ -634,16 +831,16 @@ def extrair_fato_para_salvar(prompt: str, mensagens_anteriores: list) -> str:
     p_lower = prompt.lower()
     termos_referencia = [
         "essa informação", "esta informação", "essa informacao", "esta informacao",
-        "isso", "isto", "essa resposta", "esta resposta", "esse resultado", 
+        "isso", "isto", "essa resposta", "esta resposta", "esse resultado",
         "esse fato", "o que você disse", "acima", "anterior"
     ]
     respostas_assistente = [t for a, t, _ in mensagens_anteriores if a == "assistant" and t.strip()]
-    
+
     if respostas_assistente and (any(tr in p_lower for tr in termos_referencia) or len(prompt.split()) <= 10):
         ultima_resp = respostas_assistente[-1].strip()
         ultima_resp_limpa = re.sub(r"^Com base nas fontes verificadas.*?:\s*", "", ultima_resp, flags=re.IGNORECASE).strip()
         return f"Fato registrado da conversa: {ultima_resp_limpa[:500]}"
-    
+
     return f"Fato explícito salvo a pedido do usuário: {prompt}"
 
 def gerar_resposta_contingencia(prompt: str, intencao: str, contexto_web: str, memoria_vetorial: str, contexto_anexos: str, messages: list, fato_gravado: str = "") -> str:
@@ -692,11 +889,13 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     tem_pdf = any("pdf" in (a.get("tipo") or "").lower() or (a.get("nome") or "").lower().endswith(".pdf") for a in anexos)
     tem_imagem = any(eh_arquivo_imagem(a) for a in anexos)
     tem_tabela = any((a.get("nome") or "").lower().endswith(('.csv', '.xls', '.xlsx')) for a in anexos)
-    
+
     chave_ativa = api_key_override.strip() or obter_chave_gemini()
     cliente_ativo = criar_cliente_openai(chave_ativa)
-    id_modelo_raciocinio = obter_modelo_para_modo(modo, tem_imagem=False, tem_chave=bool(chave_ativa))
-    id_modelo_visao = obter_modelo_para_modo(modo, tem_imagem=True, tem_chave=bool(chave_ativa))
+    candidatos_raciocinio = listar_candidatos_gemini(modo, chave_ativa, tem_imagem=False) if chave_ativa else ["openai"]
+    candidatos_visao = listar_candidatos_gemini(modo, chave_ativa, tem_imagem=True) if chave_ativa else ["openai"]
+    id_modelo_raciocinio = candidatos_raciocinio[0]
+    id_modelo_visao = candidatos_visao[0]
 
     mensagens_anteriores = carregar_mensagens(conversa_id)[-6:]
     ultimas_msgs_usuario = " ".join([t for a, t, _ in mensagens_anteriores[-4:] if a == "user"])
@@ -717,28 +916,29 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             id_modelo_geracao,
             imagem_referencia_bytes=imagem_referencia_bytes,
             mime_referencia=mime_ref,
-            cliente=cliente_ativo
+            cliente=cliente_ativo,
+            chave_gemini=chave_ativa
         )
         yield resultado_img
         return
 
     contexto_anexos = ""
     imagens_multimodais = []
-    
+
     # ---------------------------------------------------------
     # PASSO 1: EXTRAÇÃO DE DOCUMENTOS E PREPARAÇÃO MULTIMODAL
     # ---------------------------------------------------------
     if anexos:
         yield "🔍 Lendo documentos e extraindo contexto...\n\n"
-        
+
         for arq in anexos:
             nome_arq = arq.get("nome", "")
             tipo_arq = (arq.get("tipo") or "").lower()
-            
+
             if "pdf" in tipo_arq or nome_arq.lower().endswith(".pdf"):
                 texto_pdf = extrair_texto_pdf(arq["bytes"])
                 contexto_anexos += f"\n--- CONTEÚDO DO PDF ({nome_arq}) ---\n{texto_pdf[:4000]}...\n"
-            
+
             elif nome_arq.lower().endswith(('.csv', '.xls', '.xlsx')):
                 texto_tabela = extrair_conteudo_tabela(arq["bytes"], nome_arq)
                 contexto_anexos += f"\n--- DADOS DA TABELA/PLANILHA ({nome_arq}) ---\n{texto_tabela}\n"
@@ -795,10 +995,13 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     if contexto_anexos:
         partes_sistema.append(f"\n--- DADOS EXTRAÍDOS DOS ANEXOS ---\n{contexto_anexos}")
 
-    messages = [{"role": "system", "content": "\n".join(partes_sistema)}]
+    texto_sistema = "\n".join(partes_sistema)
+    messages = [{"role": "system", "content": texto_sistema}]
 
+    historico_pares = []
     for a, t, _ in mensagens_anteriores[-4:]:
         messages.append({"role": "user" if a == "user" else "assistant", "content": t[:1200]})
+        historico_pares.append((a, t))
 
     if intencao == "SALVAR_MEMORIA":
         texto_usuario_final = f"{prompt}\n\n[Instrução Interna: Confirme ao usuário que a informação '{fato_gravado[:200]}' já foi gravada com sucesso no seu banco vetorial ChromaDB.]"
@@ -811,45 +1014,68 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
     else:
         texto_usuario_final = prompt if prompt.strip() else "Analise e descreva os anexos enviados em detalhes."
 
-    if imagens_multimodais:
-        conteudo_multimodal = [{"type": "text", "text": texto_usuario_final}]
-        for img_info in imagens_multimodais:
-            conteudo_multimodal.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{img_info['mime']};base64,{img_info['b64']}"}
-            })
-        messages.append({"role": "user", "content": conteudo_multimodal})
-    else:
-        messages.append({"role": "user", "content": texto_usuario_final})
+    messages.append({"role": "user", "content": texto_usuario_final})
 
-    modelo_execucao = id_modelo_visao if imagens_multimodais else id_modelo_raciocinio
+    temperatura_exec = 0.2 if intencao == "BUSCA_WEB" else 0.7
     resposta_acumulada = ""
-    try:
-        stream = cliente_ativo.chat.completions.create(
-            model=modelo_execucao,
-            messages=messages,
-            temperature=0.2 if intencao == "BUSCA_WEB" else 0.7,
-            stream=True
+
+    # Imagens vão direto pela API nativa do Gemini (mais estável e sem erros 404 da camada OpenAI-compat)
+    if imagens_multimodais:
+        ok, resultado_nativo = chamar_gemini_nativo(
+            chave=chave_ativa,
+            modelos_candidatos=candidatos_visao,
+            system_text=texto_sistema,
+            historico_mensagens=historico_pares,
+            texto_usuario=texto_usuario_final,
+            imagens=imagens_multimodais,
+            temperature=temperatura_exec
         )
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                resposta_acumulada += token
-                yield token
-        if resposta_acumulada:
-            CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
-            
-    except Exception as e:
-        print(f"⚠️ API principal oscilou ({e}).")
-        if imagens_multimodais:
-            erro_limpo = str(e).replace(chave_ativa, "***") if chave_ativa else str(e)
-            yield f"⚠️ **Falha ao analisar a imagem na API do Gemini:** `{erro_limpo[:260]}`\n\nVerifique se a chave foi salva corretamente clicando em **Salvar** em **⚙️ Configurações IA** e se a cota da API está ativa."
+        if ok:
+            resposta_acumulada = resultado_nativo
+            yield resultado_nativo
+        else:
+            erro_limpo = resultado_nativo.replace(chave_ativa, "***") if chave_ativa else resultado_nativo
+            yield f"⚠️ **Falha ao analisar a imagem na API do Gemini:** `{erro_limpo[:320]}`\n\nVerifique se a chave foi salva corretamente em **⚙️ Configurações IA** e se a cota da API está ativa."
             return
-        resposta_fallback = gerar_resposta_contingencia(
-            prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages, fato_gravado=fato_gravado
-        )
-        resposta_acumulada = resposta_fallback
-        yield resposta_fallback
+    else:
+        try:
+            stream = cliente_ativo.chat.completions.create(
+                model=id_modelo_raciocinio,
+                messages=messages,
+                temperature=temperatura_exec,
+                stream=True
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    resposta_acumulada += token
+                    yield token
+            if resposta_acumulada:
+                CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
+
+        except Exception as e:
+            print(f"⚠️ API OpenAI-compat oscilou ({e}). Tentando rota nativa Gemini / contingência...")
+            if chave_ativa:
+                ok, resultado_nativo = chamar_gemini_nativo(
+                    chave=chave_ativa,
+                    modelos_candidatos=candidatos_raciocinio,
+                    system_text=texto_sistema,
+                    historico_mensagens=historico_pares,
+                    texto_usuario=texto_usuario_final,
+                    imagens=None,
+                    temperature=temperatura_exec
+                )
+                if ok:
+                    resposta_acumulada = resultado_nativo
+                    CACHE_RESPOSTAS_TEMP[prompt.lower().strip()] = resposta_acumulada
+                    yield resultado_nativo
+
+            if not resposta_acumulada:
+                resposta_fallback = gerar_resposta_contingencia(
+                    prompt, intencao, contexto_web, memoria_vetorial, contexto_anexos, messages, fato_gravado=fato_gravado
+                )
+                resposta_acumulada = resposta_fallback
+                yield resposta_fallback
 
     if "```python" in resposta_acumulada and (intencao == "EXECUTAR_CODIGO" or tem_tabela):
         try:
@@ -858,11 +1084,11 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
                 yield "\n\n⚙️ **Executando código no Code Interpreter Sandbox...**\n"
                 codigo_alvo = codigos_encontrados[-1]
                 resultado_sandbox = executar_codigo_sandbox(codigo_alvo)
-                
+
                 saida_formatada = f"\n**Resultado da Execução:**\n```text\n{resultado_sandbox['saida']}\n```"
                 resposta_acumulada += saida_formatada
                 yield saida_formatada
-                
+
                 if resultado_sandbox.get("grafico"):
                     tag_img = f"\n\n[IMAGEM_GERADA:{resultado_sandbox['grafico']}]"
                     resposta_acumulada += tag_img
@@ -871,6 +1097,11 @@ def processar_resposta_ia_stream(prompt: str, conversa_id: str, modo: str, anexo
             print(f"⚠️ Falha no Code Interpreter pós-processamento: {e}")
 
     if resposta_acumulada and "⚠️" not in resposta_acumulada:
-        resumo = gerar_micro_resumo(f"Usuário: {prompt}\nLume: {resposta_acumulada}", id_modelo_raciocinio, cliente=cliente_ativo)
+        resumo = gerar_micro_resumo(
+            f"Usuário: {prompt}\nLume: {resposta_acumulada}",
+            id_modelo_raciocinio,
+            cliente=cliente_ativo,
+            chave_gemini=chave_ativa
+        )
         if resumo:
             salvar_ou_atualizar_resumo_chat(conversa_id, f"Chat {conversa_id}: {resumo}")
