@@ -611,9 +611,17 @@ else:
             </div>
         """, unsafe_allow_html=True)
 
+        chave_atual_ui = st.session_state.get("GEMINI_API_KEY", "").strip()
+
         def gerador_limpo_com_status():
             primeiro_token = True
-            for chunk in processar_resposta_ia_stream(prompt_texto, str(chat_id_ativo), modo_raciocinio, anexos=arquivos_processados):
+            for chunk in processar_resposta_ia_stream(
+                prompt_texto,
+                str(chat_id_ativo),
+                modo_raciocinio,
+                anexos=arquivos_processados,
+                api_key_override=chave_atual_ui
+            ):
                 if chunk:
                     if primeiro_token:
                         status_placeholder.empty()
